@@ -1,0 +1,389 @@
+diff --git a/common/ebpf/android_system_resolver_cgo_test.go b/common/ebpf/android_system_resolver_cgo_test.go
+new file mode 100644
+index 00000000..f6c6a486
+--- /dev/null
++++ b/common/ebpf/android_system_resolver_cgo_test.go
+@@ -0,0 +1,49 @@
++//go:build with_ebpf && (linux || android) && cgo
++
++package ebpf
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestAndroidSystemResolverIdentity(t *testing.T) {
++	procRoot := t.TempDir()
++	processRoot := filepath.Join(procRoot, "123")
++	if err := os.MkdirAll(processRoot, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	writeFixture := func(name string, content []byte) {
++		t.Helper()
++		if err := os.WriteFile(filepath.Join(processRoot, name), content, 0o600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	writeFixture("status", []byte("Name:\tnetd\nUid:\t0\t0\t0\t0\n"))
++	writeFixture("cmdline", []byte("/system/bin/netd\x00"))
++	if err := os.Symlink("/system/bin/netd", filepath.Join(processRoot, "exe")); err != nil {
++		t.Fatal(err)
++	}
++	for _, testCase := range []struct {
++		threadName string
++		accepted   bool
++	}{
++		{threadName: "netd", accepted: true},
++		{threadName: "Binder:netd", accepted: true},
++		{threadName: "binder:123_4", accepted: true},
++		{threadName: "binder:456_4", accepted: false},
++		{threadName: "binder:123_worker", accepted: false},
++	} {
++		writeFixture("comm", []byte(testCase.threadName+"\n"))
++		if actual := isAndroidSystemResolverProcess(procRoot, "123"); actual != testCase.accepted {
++			t.Fatalf("thread name %q accepted=%t, want %t", testCase.threadName, actual, testCase.accepted)
++		}
++	}
++
++	writeFixture("comm", []byte("netd\n"))
++	writeFixture("status", []byte("Name:\tnetd\nUid:\t1000\t1000\t1000\t1000\n"))
++	if isAndroidSystemResolverProcess(procRoot, "123") {
++		t.Fatal("non-root netd identity was accepted")
++	}
++}
+diff --git a/common/ebpf/cgroup_backend_cgo.go b/common/ebpf/cgroup_backend_cgo.go
+index 55aa8f57..a025c3c2 100644
+--- a/common/ebpf/cgroup_backend_cgo.go
++++ b/common/ebpf/cgroup_backend_cgo.go
+@@ -566,6 +566,7 @@ func (b *CgroupBackend) Close() error {
+ 	if b == nil {
+ 		return nil
+ 	}
++	b.removeReadinessMarker()
+ 	b.stopAndroidSystemResolverMonitor()
+ 	b.access.Lock()
+ 	defer b.access.Unlock()
+diff --git a/common/ebpf/cgroup_stub.go b/common/ebpf/cgroup_stub.go
+index 74b81acd..67654822 100644
+--- a/common/ebpf/cgroup_stub.go
++++ b/common/ebpf/cgroup_stub.go
+@@ -24,6 +24,10 @@ func (b *CgroupBackend) Attach() error {
+ 	return E.New("eBPF inbound is not supported by this build: cgo is disabled")
+ }
+ 
++func (b *CgroupBackend) MarkReady() error {
++	return E.New("eBPF inbound is not supported by this build: cgo is disabled")
++}
++
+ func (b *CgroupBackend) Close() error {
+ 	return nil
+ }
+diff --git a/common/ebpf/map_integration_test.go b/common/ebpf/map_integration_test.go
+index db88e315..0b9ab093 100644
+--- a/common/ebpf/map_integration_test.go
++++ b/common/ebpf/map_integration_test.go
+@@ -129,3 +129,129 @@ func TestMapBatchIntegration(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestUIDPolicyMapTransactionIntegration(t *testing.T) {
++	requireEBPFIntegration(t, "test UID policy map transactions")
++	current, _, err := compileUIDPolicy(CgroupPolicy{
++		ExcludeUID: []UIDRange{{Start: 10_123, End: 10_123}},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	next, _, err := compileUIDPolicy(CgroupPolicy{
++		ExcludeUID: []UIDRange{
++			{Start: 20_123, End: 20_123},
++			{Start: 30_123, End: 30_123},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	mapFD := createIntegrationMap(t, mapCreateAttr{
++		MapType:    11,
++		KeySize:    uint32(unsafe.Sizeof(uidLPMKey{})),
++		ValueSize:  1,
++		MaxEntries: 8,
++		MapFlags:   1,
++	})
++	if err = populateUIDPolicyMap(mapFD, current); err != nil {
++		t.Fatal(err)
++	}
++	if err = replaceUIDPolicyMap(mapFD, current, next); err != nil {
++		t.Fatal(err)
++	}
++	live, err := readUIDPolicyMap(mapFD)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if uidPolicyEntriesFingerprint(live, false) != uidPolicyEntriesFingerprint(next, false) {
++		t.Fatalf("forward UID policy verification failed: %v", live)
++	}
++	if err = replaceUIDPolicyMap(mapFD, next, current); err != nil {
++		t.Fatal(err)
++	}
++	live, err = readUIDPolicyMap(mapFD)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if uidPolicyEntriesFingerprint(live, false) != uidPolicyEntriesFingerprint(current, false) {
++		t.Fatalf("reverse UID policy verification failed: %v", live)
++	}
++}
++
++func TestUIDPolicyMapCapacityFailureRollsBackIntegration(t *testing.T) {
++	requireEBPFIntegration(t, "test UID policy map rollback")
++	current := compileUIDRanges([]UIDRange{{Start: 10_123, End: 10_123}})
++	next := compileUIDRanges([]UIDRange{
++		{Start: 20_123, End: 20_123},
++		{Start: 30_123, End: 30_123},
++	})
++	mapFD := createIntegrationMap(t, mapCreateAttr{
++		MapType:    11,
++		KeySize:    uint32(unsafe.Sizeof(uidLPMKey{})),
++		ValueSize:  1,
++		MaxEntries: 2,
++		MapFlags:   1,
++	})
++	if err := populateUIDPolicyMap(mapFD, current); err != nil {
++		t.Fatal(err)
++	}
++	if err := replaceUIDPolicyMap(mapFD, current, next); err == nil {
++		t.Fatal("expected capacity-constrained UID policy update to fail")
++	}
++	live, err := readUIDPolicyMap(mapFD)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if uidPolicyEntriesFingerprint(live, false) != uidPolicyEntriesFingerprint(current, false) {
++		t.Fatalf("failed UID policy update was not rolled back: %v", live)
++	}
++}
++
++func TestUIDBypassCounterTransactionIntegration(t *testing.T) {
++	requireEBPFIntegration(t, "test UID bypass counter transactions")
++	mapFD := createIntegrationMap(t, mapCreateAttr{
++		MapType:    1,
++		KeySize:    uint32(unsafe.Sizeof(uint32(0))),
++		ValueSize:  uint32(unsafe.Sizeof(uidBypassCounter{})),
++		MaxEntries: 4,
++	})
++	if err := populateUIDBypassCounterMap(mapFD, []uint32{10_123, 20_123}); err != nil {
++		t.Fatal(err)
++	}
++	key := uint32(20_123)
++	value := uidBypassCounter{TCP: 7, UDP: 11}
++	if err := updateMap(mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
++		t.Fatal(err)
++	}
++	current, err := readUIDBypassCounterMap(mapFD)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = replaceUIDBypassCounterMap(mapFD, current, []uint32{20_123, 30_123}); err != nil {
++		t.Fatal(err)
++	}
++	live, err := readUIDBypassCounterMap(mapFD)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(live) != 2 || live[20_123] != value || live[30_123] != (uidBypassCounter{}) {
++		t.Fatalf("unexpected live UID counters: %v", live)
++	}
++}
++
++func createIntegrationMap(t *testing.T, attribute mapCreateAttr) int {
++	t.Helper()
++	fd, _, errno := unix.Syscall(
++		unix.SYS_BPF,
++		bpfMapCreate,
++		uintptr(unsafe.Pointer(&attribute)),
++		unsafe.Sizeof(attribute),
++	)
++	if errno != 0 {
++		t.Fatal(errno)
++	}
++	mapFD := int(fd)
++	t.Cleanup(func() { _ = unix.Close(mapFD) })
++	return mapFD
++}
+diff --git a/common/ebpf/readiness_cgo.go b/common/ebpf/readiness_cgo.go
+index 63e3e5de..81f6e4ed 100644
+--- a/common/ebpf/readiness_cgo.go
++++ b/common/ebpf/readiness_cgo.go
+@@ -9,8 +9,25 @@ import (
+ 	"strings"
+ )
+ 
+-// writeReadinessMarkerLocked records the attach-side readiness that the
+-// Android supervisor uses together with its authenticated Clash API check.
++// MarkReady records readiness only after the protocol layer has attached all
++// programs and made the UID policy control socket available.
++func (b *CgroupBackend) MarkReady() error {
++	if b == nil {
++		return errBackendClosed
++	}
++	b.access.Lock()
++	defer b.access.Unlock()
++	if err := b.health.requireUsable(b.runtime != nil); err != nil {
++		return err
++	}
++	if b.runtime.attached_programs == 0 {
++		return fmt.Errorf("eBPF cgroup programs are not attached")
++	}
++	return b.writeReadinessMarkerLocked()
++}
++
++// writeReadinessMarkerLocked records the readiness that the Android
++// supervisor uses together with its authenticated Clash API check.
+ // The caller holds b.access.
+ func (b *CgroupBackend) writeReadinessMarkerLocked() error {
+ 	runtimeDir := os.Getenv("AKIHALINK_RUNTIME")
+@@ -21,7 +38,7 @@ func (b *CgroupBackend) writeReadinessMarkerLocked() error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	resolverRequired := b.systemResolverTGIDMapFD >= 0
++	resolverRequired := b.includeAndroidSystemResolver
+ 	resolverAttached := !resolverRequired || len(b.systemResolverTGIDs) > 0
+ 	health := "healthy"
+ 	if resolverRequired && !resolverAttached {
+diff --git a/common/ebpf/readiness_cgo_test.go b/common/ebpf/readiness_cgo_test.go
+new file mode 100644
+index 00000000..5a18ffcb
+--- /dev/null
++++ b/common/ebpf/readiness_cgo_test.go
+@@ -0,0 +1,43 @@
++//go:build with_ebpf && (linux || android) && cgo
++
++package ebpf
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestAtomicReadinessWrite(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "runtime", "core.ready")
++	if err := atomicReadinessWrite(path, []byte("first\n")); err != nil {
++		t.Fatal(err)
++	}
++	if err := atomicReadinessWrite(path, []byte("second\n")); err != nil {
++		t.Fatal(err)
++	}
++	content, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(content) != "second\n" {
++		t.Fatalf("unexpected readiness content: %q", content)
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm() != 0o600 {
++		t.Fatalf("unexpected readiness mode: %o", info.Mode().Perm())
++	}
++}
++
++func TestCurrentProcessStartTimeForReadiness(t *testing.T) {
++	startTime, err := currentProcessStartTimeForReadiness()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if startTime == "" {
++		t.Fatal("empty process start time")
++	}
++}
+diff --git a/protocol/ebpf/inbound_lifecycle.go b/protocol/ebpf/inbound_lifecycle.go
+index ab4f8fc1..3751b332 100644
+--- a/protocol/ebpf/inbound_lifecycle.go
++++ b/protocol/ebpf/inbound_lifecycle.go
+@@ -74,7 +74,15 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
+ 					"cgroup socket-release is unavailable; using LRU cleanup fallback for UDP redirect state",
+ 				)
+ 			}
+-			i.startUIDPolicyControl()
++			if err := i.startUIDPolicyControl(); err != nil {
++				return combineStartError(err, i.cleanupStartFailure())
++			}
++			if err := backend.MarkReady(); err != nil {
++				return combineStartError(
++					E.Cause(err, "publish eBPF inbound readiness"),
++					i.cleanupStartFailure(),
++				)
++			}
+ 			bypassIPv4Count, bypassIPv6Count := backend.BypassCIDRCount()
+ 			selfBypassMode := backend.SelfBypassMode()
+ 			socketBypassCapacity := i.cgroupMapCapacity.SocketBypass
+diff --git a/protocol/ebpf/uid_policy_control.go b/protocol/ebpf/uid_policy_control.go
+index e16071c2..5e3621d8 100644
+--- a/protocol/ebpf/uid_policy_control.go
++++ b/protocol/ebpf/uid_policy_control.go
+@@ -76,43 +76,44 @@ type uidPolicyUpdateResponse struct {
+ 	ConnectionReset uidPolicyConnectionReset `json:"connectionReset"`
+ }
+ 
+-func (i *Inbound) startUIDPolicyControl() {
++func (i *Inbound) startUIDPolicyControl() error {
+ 	if !i.cgroupEnabled || i.uidPolicyControl != nil {
+-		return
++		return nil
+ 	}
+ 	socketPath := os.Getenv("AKIHALINK_UID_POLICY_SOCKET")
+ 	if socketPath == "" {
+-		return
++		if os.Getenv("AKIHALINK_RUNTIME") != "" {
++			return errors.New("eBPF UID policy control socket path is required")
++		}
++		return nil
+ 	}
+ 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+-		i.logger.Warn("create eBPF UID policy socket directory: ", err)
+-		return
++		return fmt.Errorf("create eBPF UID policy socket directory: %w", err)
+ 	}
+ 	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+-		i.logger.Warn("remove stale eBPF UID policy socket: ", err)
+-		return
++		return fmt.Errorf("remove stale eBPF UID policy socket: %w", err)
+ 	}
+ 	listener, err := net.Listen("unix", socketPath)
+ 	if err != nil {
+-		i.logger.Warn("listen for eBPF UID policy updates: ", err)
+-		return
++		return fmt.Errorf("listen for eBPF UID policy updates: %w", err)
+ 	}
+ 	if err = os.Chmod(socketPath, 0o600); err != nil {
+ 		_ = listener.Close()
+ 		_ = os.Remove(socketPath)
+-		i.logger.Warn("protect eBPF UID policy socket: ", err)
+-		return
++		return fmt.Errorf("protect eBPF UID policy socket: %w", err)
+ 	}
+ 	control := &uidPolicyControl{
+ 		listener: listener, path: socketPath, generation: 1,
+ 		configured: append([]ECommon.UIDRange(nil), i.cgroupPolicy.ExcludeUID...), known: true,
+ 	}
+ 	if _, err = control.status(i); err != nil {
+-		control.known = false
+-		i.logger.Warn("inspect initial eBPF UID policy: ", err)
++		_ = listener.Close()
++		_ = os.Remove(socketPath)
++		return fmt.Errorf("inspect initial eBPF UID policy: %w", err)
+ 	}
+ 	i.uidPolicyControl = control
+ 	go i.serveUIDPolicyControl(control)
++	return nil
+ }
+ 
+ func (i *Inbound) stopUIDPolicyControl() {

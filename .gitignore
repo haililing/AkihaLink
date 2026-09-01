@@ -1,0 +1,16 @@
+.gradle/
+.kotlin/
+.idea/
+local.properties
+**/build/
+*.iml
+*.jks
+*.keystore
+dist/
+/app/release/
+module/system/bin/sing-box
+module/.work/
+6.6.118-*.zip
+
+.codex-current.png
+.codex-window.xml

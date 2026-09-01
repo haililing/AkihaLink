@@ -1,0 +1,598 @@
+diff --git a/common/ebpf/android_system_resolver_cgo.go b/common/ebpf/android_system_resolver_cgo.go
+new file mode 100644
+index 00000000..b6dc5bb3
+--- /dev/null
++++ b/common/ebpf/android_system_resolver_cgo.go
+@@ -0,0 +1,224 @@
++//go:build with_ebpf && (linux || android) && cgo
++
++package ebpf
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++	"unsafe"
++
++	E "github.com/sagernet/sing/common/exceptions"
++	"golang.org/x/sys/unix"
++)
++
++const (
++	androidSystemResolverRefreshInterval = 2 * time.Second
++	maxAndroidSystemResolverTGIDs        = 16
++)
++
++func discoverAndroidSystemResolverTGIDs(enabled bool) (map[uint32]struct{}, error) {
++	result := make(map[uint32]struct{})
++	if !enabled {
++		return result, nil
++	}
++	entries, err := os.ReadDir("/proc")
++	if err != nil {
++		return nil, err
++	}
++	for _, entry := range entries {
++		pid, parseErr := strconv.ParseUint(entry.Name(), 10, 32)
++		if parseErr != nil || !isAndroidSystemResolverProcess("/proc", entry.Name()) {
++			continue
++		}
++		result[uint32(pid)] = struct{}{}
++		if len(result) > maxAndroidSystemResolverTGIDs {
++			return nil, fmt.Errorf("too many Android netd processes")
++		}
++	}
++	return result, nil
++}
++
++func isAndroidSystemResolverProcess(procRoot string, processName string) bool {
++	processRoot := filepath.Join(procRoot, processName)
++	comm, err := os.ReadFile(filepath.Join(processRoot, "comm"))
++	if err != nil {
++		return false
++	}
++	threadName := strings.TrimSpace(string(comm))
++	if !isAndroidSystemResolverThreadName(threadName, processName) {
++		return false
++	}
++	status, err := os.ReadFile(filepath.Join(processRoot, "status"))
++	if err != nil || !hasRootUID(status) {
++		return false
++	}
++	executable, err := os.Readlink(filepath.Join(processRoot, "exe"))
++	if err != nil || filepath.Base(strings.TrimSuffix(executable, " (deleted)")) != "netd" {
++		return false
++	}
++	commandLine, err := os.ReadFile(filepath.Join(processRoot, "cmdline"))
++	if err != nil {
++		return false
++	}
++	command := strings.SplitN(string(commandLine), "\x00", 2)[0]
++	return filepath.Base(command) == "netd"
++}
++
++func isAndroidSystemResolverThreadName(threadName string, processName string) bool {
++	if threadName == "netd" || threadName == "Binder:netd" {
++		return true
++	}
++	threadIndex, found := strings.CutPrefix(threadName, "binder:"+processName+"_")
++	if !found || threadIndex == "" {
++		return false
++	}
++	_, err := strconv.ParseUint(threadIndex, 10, 32)
++	return err == nil
++}
++
++func hasRootUID(status []byte) bool {
++	for _, line := range strings.Split(string(status), "\n") {
++		fields := strings.Fields(line)
++		if len(fields) >= 2 && fields[0] == "Uid:" {
++			return fields[1] == "0"
++		}
++	}
++	return false
++}
++
++func (b *CgroupBackend) replaceAndroidSystemResolverTGIDs(next map[uint32]struct{}) error {
++	if b == nil {
++		return errBackendClosed
++	}
++	b.access.Lock()
++	defer b.access.Unlock()
++	if err := b.health.requireUsable(b.runtime != nil); err != nil {
++		return err
++	}
++	if b.systemResolverTGIDMapFD < 0 {
++		if len(next) != 0 {
++			return E.New("Android system resolver map is unavailable")
++		}
++		return nil
++	}
++	additions := make([]uint32, 0, len(next))
++	for tgid := range next {
++		if _, present := b.systemResolverTGIDs[tgid]; !present {
++			additions = append(additions, tgid)
++		}
++	}
++	removals := make([]uint32, 0, len(b.systemResolverTGIDs))
++	for tgid := range b.systemResolverTGIDs {
++		if _, present := next[tgid]; !present {
++			removals = append(removals, tgid)
++		}
++	}
++	added, removed, updateErr := replaceUint32SetMap(b.systemResolverTGIDMapFD, additions, removals)
++	if updateErr != nil {
++		rollbackErr := rollbackUint32SetMap(b.systemResolverTGIDMapFD, added, removed)
++		err := policyUpdateError(updateErr, rollbackErr)
++		if policyRollbackFailed(err) {
++			return E.Errors(err, b.health.invalidate("cgroup", "Android system resolver TGID"))
++		}
++		return err
++	}
++	b.systemResolverTGIDs = cloneUint32Set(next)
++	return nil
++}
++
++func replaceUint32SetMap(mapFD int, additions, removals []uint32) ([]uint32, []uint32, error) {
++	value := uint8(1)
++	added := make([]uint32, 0, len(additions))
++	for _, key := range additions {
++		if err := updateMapWithFlags(mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value), bpfNoExist); err != nil {
++			if errors.Is(err, unix.EEXIST) {
++				continue
++			}
++			return added, nil, err
++		}
++		added = append(added, key)
++	}
++	removed := make([]uint32, 0, len(removals))
++	for _, key := range removals {
++		if err := deleteMap(mapFD, unsafe.Pointer(&key)); err != nil {
++			if errors.Is(err, unix.ENOENT) {
++				continue
++			}
++			return added, removed, err
++		}
++		removed = append(removed, key)
++	}
++	return added, removed, nil
++}
++
++func rollbackUint32SetMap(mapFD int, added, removed []uint32) error {
++	value := uint8(1)
++	var rollbackErr error
++	for _, key := range removed {
++		if err := updateMap(mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	for _, key := range added {
++		if err := deleteMap(mapFD, unsafe.Pointer(&key)); err != nil && !errors.Is(err, unix.ENOENT) {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	return rollbackErr
++}
++
++func cloneUint32Set(source map[uint32]struct{}) map[uint32]struct{} {
++	cloned := make(map[uint32]struct{}, len(source))
++	for value := range source {
++		cloned[value] = struct{}{}
++	}
++	return cloned
++}
++
++func (b *CgroupBackend) startAndroidSystemResolverMonitorLocked() {
++	b.systemResolverMonitorMu.Lock()
++	defer b.systemResolverMonitorMu.Unlock()
++	if !b.includeAndroidSystemResolver || b.systemResolverTGIDMapFD < 0 || b.systemResolverStop != nil {
++		return
++	}
++	stop := make(chan struct{})
++	done := make(chan struct{})
++	b.systemResolverStop = stop
++	b.systemResolverDone = done
++	go func() {
++		defer close(done)
++		ticker := time.NewTicker(androidSystemResolverRefreshInterval)
++		defer ticker.Stop()
++		for {
++			select {
++			case <-stop:
++				return
++			case <-ticker.C:
++				next, err := discoverAndroidSystemResolverTGIDs(true)
++				if err == nil && len(next) != 0 {
++					_ = b.replaceAndroidSystemResolverTGIDs(next)
++				}
++			}
++		}
++	}()
++}
++
++func (b *CgroupBackend) stopAndroidSystemResolverMonitor() {
++	if b == nil {
++		return
++	}
++	b.systemResolverMonitorMu.Lock()
++	defer b.systemResolverMonitorMu.Unlock()
++	if b.systemResolverStop == nil {
++		return
++	}
++	close(b.systemResolverStop)
++	<-b.systemResolverDone
++	b.systemResolverStop = nil
++	b.systemResolverDone = nil
++}
+diff --git a/common/ebpf/cgroup_backend_cgo.go b/common/ebpf/cgroup_backend_cgo.go
+index 9f61cffd..9410b151 100644
+--- a/common/ebpf/cgroup_backend_cgo.go
++++ b/common/ebpf/cgroup_backend_cgo.go
+@@ -15,6 +15,7 @@ static int singbox_ebpf_cgroup_prepare(
+ 	bool enable_bypass_ipv4_cidr,
+ 	bool enable_bypass_ipv6_cidr,
+ 	bool auto_ipv6,
++	bool enable_system_resolver,
+ 	uint32_t uid_policy_entries,
+ 	bool uid_default_bypass,
+ 	uint32_t tcp_redirect_map_capacity,
+@@ -29,6 +30,7 @@ static int singbox_ebpf_cgroup_prepare(
+ 		enable_bypass_ipv4_cidr,
+ 		enable_bypass_ipv6_cidr,
+ 		auto_ipv6,
++		enable_system_resolver,
+ 		uid_policy_entries,
+ 		uid_default_bypass,
+ 		tcp_redirect_map_capacity,
+@@ -156,6 +158,12 @@ type CgroupBackend struct {
+ 	uidPolicyEntries      []uidLPMKey
+ 	uidPolicy             CgroupPolicy
+ 	uidDefaultBypass      bool
++	systemResolverTGIDMapFD      int
++	systemResolverTGIDs          map[uint32]struct{}
++	includeAndroidSystemResolver bool
++	systemResolverMonitorMu      sync.Mutex
++	systemResolverStop           chan struct{}
++	systemResolverDone           chan struct{}
+ 	bypassIPv4CIDR        []netip.Prefix
+ 	bypassIPv6CIDR        []netip.Prefix
+ 	cgroupPath            string
+@@ -225,6 +233,13 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 	if err = checkLPMTriePolicyCompatibility("UID", len(uidPolicyEntries)); err != nil {
+ 		return nil, err
+ 	}
++	systemResolverTGIDs, err := discoverAndroidSystemResolverTGIDs(policy.IncludeAndroidSystemResolver)
++	if err != nil {
++		return nil, E.Cause(err, "discover Android system resolver")
++	}
++	if policy.IncludeAndroidSystemResolver && len(systemResolverTGIDs) == 0 {
++		return nil, E.New("verified root netd process was not found")
++	}
+ 	if cgroupPath == "" {
+ 		cgroupPath, err = DetectCgroup2Mount()
+ 		if err != nil {
+@@ -255,6 +270,7 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 		C.bool(policy.EnableBypassCIDR && redirectIPv4.IsValid()),
+ 		C.bool(policy.EnableBypassCIDR && redirectIPv6.IsValid()),
+ 		C.bool(config.AutoIPv6),
++		C.bool(policy.IncludeAndroidSystemResolver),
+ 		C.uint32_t(len(uidPolicyEntries)),
+ 		C.bool(uidDefaultBypass),
+ 		C.uint32_t(mapCapacity.TCPRedirect),
+@@ -273,31 +289,34 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 		return nil, eBPFBackendOperationError("prepare eBPF inbound", errorStage, prepareErr)
+ 	}
+ 	backend := &CgroupBackend{
+-		mapCapacity:          mapCapacity,
+-		runtime:              runtimeState,
+-		tcpRedirectMapFD:     int(runtimeState.tcp_redirect_map_fd),
+-		statsMapFD:           int(runtimeState.stats_map_fd),
+-		udpRedirectMapFD:     int(runtimeState.udp_redirect_map_fd),
+-		udpFlowMapFD:         int(runtimeState.udp_flow_map_fd),
+-		socketBypassMapFD:    int(runtimeState.bypass_socket_cookie_map_fd),
+-		bypassIPv4CIDRMapFD:  int(runtimeState.bypass_ipv4_cidr_map_fd),
+-		bypassIPv6CIDRMapFD:  int(runtimeState.bypass_ipv6_cidr_map_fd),
+-		ipv6AvailableMapFD:   int(runtimeState.ipv6_available_map_fd),
+-		uidPolicyMapFD:       int(runtimeState.uid_policy_map_fd),
+-		uidPolicyEntries:     slices.Clone(uidPolicyEntries),
+-		uidPolicy:            cloneCgroupPolicy(policy),
+-		uidDefaultBypass:     uidDefaultBypass,
+-		cgroupPath:           cgroupPath,
+-		redirectIPv4:         redirectIPv4,
+-		redirectIPv6:         redirectIPv6,
+-		enableIPv6:           config.EnableIPv6,
+-		autoIPv6:             config.AutoIPv6,
+-		ipv6Available:        false,
+-		enableUDP:            config.EnableUDP,
+-		hijackDNS:            policy.HijackDNS,
+-		bypassPrivateAddress: policy.BypassPrivateAddress,
+-		dnsRespectBypass:     policy.DNSRespectBypass,
+-		udpTimeoutSeconds:    udpTimeoutSeconds,
++		mapCapacity:                  mapCapacity,
++		runtime:                      runtimeState,
++		tcpRedirectMapFD:             int(runtimeState.tcp_redirect_map_fd),
++		statsMapFD:                   int(runtimeState.stats_map_fd),
++		udpRedirectMapFD:             int(runtimeState.udp_redirect_map_fd),
++		udpFlowMapFD:                 int(runtimeState.udp_flow_map_fd),
++		socketBypassMapFD:            int(runtimeState.bypass_socket_cookie_map_fd),
++		bypassIPv4CIDRMapFD:          int(runtimeState.bypass_ipv4_cidr_map_fd),
++		bypassIPv6CIDRMapFD:          int(runtimeState.bypass_ipv6_cidr_map_fd),
++		ipv6AvailableMapFD:           int(runtimeState.ipv6_available_map_fd),
++		uidPolicyMapFD:               int(runtimeState.uid_policy_map_fd),
++		uidPolicyEntries:             slices.Clone(uidPolicyEntries),
++		uidPolicy:                    cloneCgroupPolicy(policy),
++		uidDefaultBypass:             uidDefaultBypass,
++		systemResolverTGIDMapFD:      int(runtimeState.system_resolver_tgid_map_fd),
++		systemResolverTGIDs:          make(map[uint32]struct{}),
++		includeAndroidSystemResolver: policy.IncludeAndroidSystemResolver,
++		cgroupPath:                   cgroupPath,
++		redirectIPv4:                 redirectIPv4,
++		redirectIPv6:                 redirectIPv6,
++		enableIPv6:                   config.EnableIPv6,
++		autoIPv6:                     config.AutoIPv6,
++		ipv6Available:                false,
++		enableUDP:                    config.EnableUDP,
++		hijackDNS:                    policy.HijackDNS,
++		bypassPrivateAddress:         policy.BypassPrivateAddress,
++		dnsRespectBypass:             policy.DNSRespectBypass,
++		udpTimeoutSeconds:            udpTimeoutSeconds,
+ 	}
+ 	if config.AutoIPv6 {
+ 		if _, err = backend.updateIPv6AvailableLocked(config.IPv6Available); err != nil {
+@@ -309,6 +328,10 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 		_ = backend.Close()
+ 		return nil, E.Cause(err, "populate UID policy eBPF map")
+ 	}
++	if err = backend.replaceAndroidSystemResolverTGIDs(systemResolverTGIDs); err != nil {
++		_ = backend.Close()
++		return nil, E.Cause(err, "initialize Android system resolver eBPF map")
++	}
+ 	return backend, nil
+ }
+ 
+@@ -525,6 +548,7 @@ func (b *CgroupBackend) Attach() error {
+ 			syscall.Errno(savedErrno),
+ 		)
+ 	}
++	b.startAndroidSystemResolverMonitorLocked()
+ 	return nil
+ }
+ 
+@@ -532,6 +556,7 @@ func (b *CgroupBackend) Close() error {
+ 	if b == nil {
+ 		return nil
+ 	}
++	b.stopAndroidSystemResolverMonitor()
+ 	b.access.Lock()
+ 	defer b.access.Unlock()
+ 	if b.runtime == nil {
+@@ -552,6 +577,9 @@ func (b *CgroupBackend) Close() error {
+ 		b.uidPolicyMapFD = -1
+ 		b.uidPolicyEntries = nil
+ 		b.uidPolicy = CgroupPolicy{}
++		b.systemResolverTGIDMapFD = -1
++		b.systemResolverTGIDs = nil
++		b.includeAndroidSystemResolver = false
+ 		b.bypassIPv4CIDR = nil
+ 		b.bypassIPv6CIDR = nil
+ 	}
+diff --git a/common/ebpf/cgroup_policy.go b/common/ebpf/cgroup_policy.go
+index b96c7240..12ae16f3 100644
+--- a/common/ebpf/cgroup_policy.go
++++ b/common/ebpf/cgroup_policy.go
+@@ -19,13 +19,14 @@ const (
+ )
+ 
+ type CgroupPolicy struct {
+-	EnableBypassCIDR     bool
+-	HijackDNS            bool
+-	DNSRespectBypass     bool
+-	BypassPrivateAddress bool
+-	IncludeUIDConfigured bool
+-	IncludeUID           []UIDRange
+-	ExcludeUID           []UIDRange
++	EnableBypassCIDR             bool
++	HijackDNS                    bool
++	DNSRespectBypass             bool
++	BypassPrivateAddress         bool
++	IncludeUIDConfigured         bool
++	IncludeUID                   []UIDRange
++	ExcludeUID                   []UIDRange
++	IncludeAndroidSystemResolver bool
+ }
+ 
+ type UIDRange struct {
+diff --git a/common/ebpf/native/abi.h b/common/ebpf/native/abi.h
+index f9d9f269..d495803e 100644
+--- a/common/ebpf/native/abi.h
++++ b/common/ebpf/native/abi.h
+@@ -26,6 +26,7 @@
+ #define SB_EBPF_CGROUP_FLAG_UDP_FLOW (1U << 10U)
+ #define SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS (1U << 11U)
+ #define SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS (1U << 12U)
++#define SB_EBPF_CGROUP_FLAG_SYSTEM_RESOLVER (1U << 13U)
+ #define SB_EBPF_CGROUP_STAT_TCP_REDIRECT_FAILURE 0U
+ #define SB_EBPF_CGROUP_STAT_UDP_REDIRECT_FAILURE 1U
+ #define SB_EBPF_CGROUP_STAT_COUNT 2U
+diff --git a/common/ebpf/native/cgroup.bpf.c b/common/ebpf/native/cgroup.bpf.c
+index 15ad4a05..ab5602d6 100644
+--- a/common/ebpf/native/cgroup.bpf.c
++++ b/common/ebpf/native/cgroup.bpf.c
+@@ -55,6 +55,7 @@ MAP(cgroup_udp_peer, struct sb_ebpf_udp_peer_key, struct sb_ebpf_udp_peer_value,
+ MAP(cgroup_udp_flow, struct sb_ebpf_udp_flow_key, struct sb_ebpf_udp_flow_value, BPF_MAP_TYPE_LRU_HASH);
+ MAP(cgroup_socket_bypass, __u64, __u8, BPF_MAP_TYPE_LRU_HASH);
+ MAP(cgroup_uid_policy, struct sb_ebpf_uid_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
++MAP(cgroup_system_resolver_tgid, __u32, __u8, BPF_MAP_TYPE_HASH);
+ MAP(cgroup_bypass_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
+ MAP(cgroup_bypass_ipv6, struct sb_ebpf_ipv6_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
+ MAP(cgroup_ipv6_available, __u32, __u32, BPF_MAP_TYPE_ARRAY);
+@@ -100,17 +101,26 @@ INLINE bool is_cookie_bypassed(void *ctx) {
+     return map_lookup(&cgroup_socket_bypass, &cookie) != 0;
+ }
+ 
+-INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config) {
++INLINE bool system_resolver_selected(const struct sb_ebpf_cgroup_control *config, __u16 port) {
++    if ((config->flags & SB_EBPF_CGROUP_FLAG_SYSTEM_RESOLVER) == 0U ||
++        (port != 53U && port != 853U && port != 443U)) return false;
++    __u32 tgid = (__u32)(get_current_pid_tgid() >> 32);
++    return map_lookup(&cgroup_system_resolver_tgid, &tgid) != 0;
++}
++
++INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config, __u16 port) {
+     if ((config->flags & SB_EBPF_CGROUP_FLAG_UID_POLICY) == 0U) return false;
+-    __u32 uid = swap32((__u32)get_current_uid_gid());
++    __u32 raw_uid = (__u32)get_current_uid_gid();
++    __u32 uid = swap32(raw_uid);
+     struct sb_ebpf_uid_lpm_key key = {
+         .prefixlen = 32U,
+     };
+     __builtin_memcpy(key.uid, &uid, sizeof(uid));
+     bool matched = map_lookup(&cgroup_uid_policy, &key) != 0;
+-    return (config->flags & SB_EBPF_CGROUP_FLAG_UID_DEFAULT_BYPASS) != 0U
++    bool bypassed = (config->flags & SB_EBPF_CGROUP_FLAG_UID_DEFAULT_BYPASS) != 0U
+         ? !matched
+         : matched;
++    return bypassed && !system_resolver_selected(config, port);
+ }
+ 
+ INLINE bool protocol_selected(const struct sb_ebpf_cgroup_control *config, __u8 protocol) {
+@@ -167,7 +177,7 @@ INLINE bool base_bypass(void *ctx, const struct sb_ebpf_cgroup_control *config,
+     if (!protocol_selected(config, protocol)) return true;
+     if (service_port(protocol, port)) return true;
+     if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) == 0U && port == 53U) return true;
+-    if (uid_bypassed(config)) return true;
++    if (uid_bypassed(config, port)) return true;
+     return false;
+ }
+ 
+diff --git a/common/ebpf/native/cgroup.c b/common/ebpf/native/cgroup.c
+index 30737ea0..d1a2bdb4 100644
+--- a/common/ebpf/native/cgroup.c
++++ b/common/ebpf/native/cgroup.c
+@@ -55,6 +55,7 @@ static void init_runtime(struct sb_ebpf_cgroup_runtime *runtime) {
+     runtime->enable_udp = false;
+     runtime->uid_policy = false;
+     runtime->uid_default_bypass = false;
++    runtime->system_resolver = false;
+     runtime->bypass_ipv4_policy = false;
+     runtime->bypass_ipv6_policy = false;
+     runtime->auto_ipv6 = false;
+diff --git a/common/ebpf/native/cgroup_loader.c b/common/ebpf/native/cgroup_loader.c
+index d50ec6fa..9e2bc6da 100644
+--- a/common/ebpf/native/cgroup_loader.c
++++ b/common/ebpf/native/cgroup_loader.c
+@@ -211,6 +211,7 @@ static int cgroup_object_map_fd(const char *name, void *context) {
+         MAP_BINDING("cgroup_udp_flow", udp_flow_map_fd),
+         MAP_BINDING("cgroup_socket_bypass", bypass_socket_cookie_map_fd),
+         MAP_BINDING("cgroup_uid_policy", uid_policy_map_fd),
++        MAP_BINDING("cgroup_system_resolver_tgid", system_resolver_tgid_map_fd),
+         MAP_BINDING("cgroup_bypass_ipv4", bypass_ipv4_cidr_map_fd),
+         MAP_BINDING("cgroup_bypass_ipv6", bypass_ipv6_cidr_map_fd),
+         MAP_BINDING("cgroup_ipv6_available", ipv6_available_map_fd),
+@@ -311,6 +312,7 @@ static int update_cgroup_control(
+     if (dns_respect_bypass) control.flags |= SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS;
+     if (runtime->uid_policy) control.flags |= SB_EBPF_CGROUP_FLAG_UID_POLICY;
+     if (runtime->uid_default_bypass) control.flags |= SB_EBPF_CGROUP_FLAG_UID_DEFAULT_BYPASS;
++    if (runtime->system_resolver) control.flags |= SB_EBPF_CGROUP_FLAG_SYSTEM_RESOLVER;
+     if (runtime->bypass_ipv4_policy) control.flags |= SB_EBPF_CGROUP_FLAG_BYPASS_IPV4;
+     if (runtime->bypass_ipv6_policy) control.flags |= SB_EBPF_CGROUP_FLAG_BYPASS_IPV6;
+     if (runtime->auto_ipv6) control.flags |= SB_EBPF_CGROUP_FLAG_AUTO_IPV6;
+diff --git a/common/ebpf/native/cgroup_runtime.c b/common/ebpf/native/cgroup_runtime.c
+index c8b5440a..61d5fcb5 100644
+--- a/common/ebpf/native/cgroup_runtime.c
++++ b/common/ebpf/native/cgroup_runtime.c
+@@ -29,6 +29,7 @@ int sb_ebpf_cgroup_prepare(
+ 	bool enable_bypass_ipv4_cidr,
+ 	bool enable_bypass_ipv6_cidr,
+ 	bool auto_ipv6,
++	bool enable_system_resolver,
+ 	uint32_t uid_policy_entries,
+ 	bool uid_default_bypass,
+ 	uint32_t tcp_redirect_map_capacity,
+@@ -55,6 +56,7 @@ int sb_ebpf_cgroup_prepare(
+     runtime->enable_udp = enable_udp;
+     runtime->uid_policy = uid_policy_entries > 0U || uid_default_bypass;
+     runtime->uid_default_bypass = uid_default_bypass;
++    runtime->system_resolver = enable_system_resolver;
+     runtime->bypass_ipv4_policy = enable_bypass_ipv4_cidr;
+     runtime->bypass_ipv6_policy = enable_bypass_ipv6_cidr;
+     runtime->auto_ipv6 = auto_ipv6;
+@@ -91,8 +93,11 @@ int sb_ebpf_cgroup_prepare(
+          enable_udp && runtime->socket_release_supported ? udp_redirect_map_capacity : 1U,
+          0U, &runtime->udp_flow_map_fd},
+         {"UID policy", (enum bpf_map_type)SB_EBPF_LPM_TRIE_MAP_TYPE,
+-         sizeof(struct sb_ebpf_uid_lpm_key), sizeof(uint8_t), uid_policy_entries > 0U ? uid_policy_entries : 1U,
++         sizeof(struct sb_ebpf_uid_lpm_key), sizeof(uint8_t), SB_EBPF_MAX_POLICY_MAP_ENTRIES,
+          BPF_F_NO_PREALLOC, &runtime->uid_policy_map_fd},
++        {"system resolver TGID", (enum bpf_map_type)SB_EBPF_HASH_MAP_TYPE,
++         sizeof(uint32_t), sizeof(uint8_t), SB_EBPF_MAX_SYSTEM_RESOLVER_TGIDS,
++         0U, &runtime->system_resolver_tgid_map_fd},
+         {"IPv4 bypass CIDR", (enum bpf_map_type)SB_EBPF_LPM_TRIE_MAP_TYPE,
+          sizeof(struct sb_ebpf_ipv4_cidr_lpm_key), sizeof(uint8_t),
+          SB_EBPF_MAX_BYPASS_CIDR_MAP_ENTRIES,
+@@ -230,6 +235,7 @@ int sb_ebpf_cgroup_close(struct sb_ebpf_cgroup_runtime *runtime) {
+         }
+     }
+     int *runtime_fds[] = {
++        &runtime->system_resolver_tgid_map_fd,
+         &runtime->uid_policy_map_fd,
+         &runtime->bypass_ipv6_cidr_map_fd,
+         &runtime->ipv6_available_map_fd,
+diff --git a/common/ebpf/native/runtime.h b/common/ebpf/native/runtime.h
+index c915bc06..f70e0d1b 100644
+--- a/common/ebpf/native/runtime.h
++++ b/common/ebpf/native/runtime.h
+@@ -13,6 +13,7 @@
+ 
+ #define SB_EBPF_DEFAULT_CGROUP_PATH "/sys/fs/cgroup"
+ #define SB_EBPF_MAX_POLICY_MAP_ENTRIES 4096U
++#define SB_EBPF_MAX_SYSTEM_RESOLVER_TGIDS 16U
+ #define SB_EBPF_MAX_BYPASS_CIDR_MAP_ENTRIES 65536U
+ #define SB_EBPF_MAX_CONFIGURABLE_MAP_ENTRIES 1048576U
+ #define SB_EBPF_ERROR_STAGE_SIZE 64U
+@@ -63,6 +64,7 @@ struct sb_ebpf_cgroup_runtime {
+     int udp_flow_map_fd;
+     int bypass_socket_cookie_map_fd;
+     int uid_policy_map_fd;
++    int system_resolver_tgid_map_fd;
+     int bypass_ipv4_cidr_map_fd;
+     int bypass_ipv6_cidr_map_fd;
+     int ipv6_available_map_fd;
+@@ -73,6 +75,7 @@ struct sb_ebpf_cgroup_runtime {
+     bool enable_udp;
+     bool uid_policy;
+     bool uid_default_bypass;
++    bool system_resolver;
+     bool bypass_ipv4_policy;
+     bool bypass_ipv6_policy;
+     bool auto_ipv6;
+@@ -111,6 +114,7 @@ int sb_ebpf_cgroup_prepare(
+     bool enable_bypass_ipv4_cidr,
+     bool enable_bypass_ipv6_cidr,
+     bool auto_ipv6,
++    bool enable_system_resolver,
+     uint32_t uid_policy_entries,
+     bool uid_default_bypass,
+     uint32_t tcp_redirect_map_capacity,
+diff --git a/protocol/ebpf/inbound.go b/protocol/ebpf/inbound.go
+index 70dceb34..1455099f 100644
+--- a/protocol/ebpf/inbound.go
++++ b/protocol/ebpf/inbound.go
+@@ -188,9 +188,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 		sharedNetworkIncludeMAC:  sharedNetworkIncludeMAC,
+ 		sharedNetworkExcludeMAC:  sharedNetworkExcludeMAC,
+ 		cgroupPolicy: ECommon.CgroupPolicy{
+-			HijackDNS:            dnsMode != dnsModeOff,
+-			DNSRespectBypass:     dnsMode == dnsModeRespectBypassHijack,
+-			BypassPrivateAddress: options.BypassPrivateAddress == nil || *options.BypassPrivateAddress,
++			HijackDNS:                    dnsMode != dnsModeOff,
++			DNSRespectBypass:             dnsMode == dnsModeRespectBypassHijack,
++			BypassPrivateAddress:         options.BypassPrivateAddress == nil || *options.BypassPrivateAddress,
++			IncludeAndroidSystemResolver: runtime.GOOS == "android" && dnsMode == dnsModeHijack,
+ 			IncludeUIDConfigured: len(options.IncludeUID) > 0 ||
+ 				len(options.IncludeUIDRange) > 0 || len(options.IncludePackage) > 0,
+ 			IncludeUID: includeUIDRanges,

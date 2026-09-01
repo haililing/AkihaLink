@@ -1,0 +1,1867 @@
+#!/system/bin/sh
+
+umask 077
+MODDIR=${0%/*}
+DATA=${AKIHALINK_DATA_DIR:-/data/adb/akihalink}
+CONFIG_DIR="$DATA/config"
+RUNTIME="$DATA/runtime"
+LOGDIR="$DATA/log"
+CORE=${AKIHALINK_CORE:-$MODDIR/sing-box}
+SUPERVISOR=${AKIHALINK_SUPERVISOR:-$MODDIR/supervisor.sh}
+PROTOCOL=16
+MODULE_VERSION=1.1
+CORE_COMMIT=90bb3d43634b56b38834a239f3129d3009ece9d4
+CORE_PATCH_SET=akihalink-upstream-ebpf-v16
+MAIN_API_PORT=9090
+SPEEDTEST_PORT=19090
+SPEEDTEST_TIMEOUT_SECONDS=1800
+SPEEDTEST_CONFIG="$RUNTIME/speedtest.json"
+SPEEDTEST_LOG="$LOGDIR/speedtest.log"
+SPEEDTEST_ERROR="$RUNTIME/speedtest_error"
+SPEEDTEST_READINESS="$RUNTIME/speedtest.readiness"
+OBSERVABILITY_SOCKET="$RUNTIME/observability.sock"
+UID_POLICY_SOCKET="$RUNTIME/uid-policy.sock"
+OBSERVABILITY_PIN_ROOT="/sys/fs/bpf/akihalink/generic/v1"
+OBSERVABILITY_LOG="$LOGDIR/observability.log"
+TRACE_CONTEXT="$RUNTIME/trace-context"
+CONTROL_LOCK="$RUNTIME/control.lock"
+CONTROL_LOCK_TIMEOUT=60
+CONTROL_LOCK_HELD=false
+ACTIVATION_TRANSACTION="$RUNTIME/activation.pending"
+ACTIVATION_BACKUP="$CONFIG_DIR/activation.previous.json"
+STARTUP_WAIT_SECONDS=${AKIHALINK_STARTUP_WAIT_SECONDS:-8}
+STARTUP_POLL_SECONDS=${AKIHALINK_STARTUP_POLL_SECONDS:-0.2}
+STARTUP_POLL_PER_SECOND=5
+CORE_READINESS="$RUNTIME/core.ready"
+STARTUP_READINESS="$RUNTIME/startup.ready"
+DNS_CACHE_FLUSH_STATUS="$RUNTIME/android_dns_cache_flush"
+HOTSPOT_STATE="$RUNTIME/hotspot.state"
+HOTSPOT_PROBE_CACHE="$RUNTIME/hotspot-probe.cache"
+
+mkdir -p "$CONFIG_DIR" "$RUNTIME" "$LOGDIR"
+chmod 0700 "$DATA" "$CONFIG_DIR" "$RUNTIME" "$LOGDIR" 2>/dev/null
+
+json_escape() {
+  # Keep status output parseable when core errors contain quotes, backslashes,
+  # ANSI sequences, or newlines. Control bytes are omitted before escaping so
+  # Android toybox sed always handles a single JSON string line.
+  printf '%s' "$1" |
+    sed "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" |
+    tr -d '\000-\037' |
+    sed -e 's/\\/\\\\/g' -e 's/"/\\&/g'
+}
+
+detected_core_patch_set() {
+  core_version="$("$CORE" version 2>/dev/null | sed -n '1p')"
+  case "$core_version" in
+    *-"$CORE_PATCH_SET") printf '%s' "$CORE_PATCH_SET" ;;
+    *) printf '%s' '' ;;
+  esac
+}
+
+contains_removed_android_system_resolver_option() {
+  grep -q '"include_android_system_resolver"[[:space:]]*:' "$1" 2>/dev/null
+}
+
+legacy_config_error() {
+  printf '%s\n' \
+    'Saved configuration uses removed include_android_system_resolver; open AkihaLink and apply the selected node again'
+}
+
+valid_trace_id() {
+  printf '%s' "$1" | grep -Eq '^[0-9a-f]{16}$'
+}
+
+trace_marker_path() {
+  if [ -n "${AKIHALINK_TRACE_MARKER:-}" ] && [ -w "$AKIHALINK_TRACE_MARKER" ]; then
+    printf '%s' "$AKIHALINK_TRACE_MARKER"
+  elif [ -w /sys/kernel/tracing/trace_marker ]; then
+    printf '%s' /sys/kernel/tracing/trace_marker
+  elif [ -w /sys/kernel/debug/tracing/trace_marker ]; then
+    printf '%s' /sys/kernel/debug/tracing/trace_marker
+  fi
+}
+
+trace_write() {
+  marker="$(trace_marker_path)"
+  [ -n "$marker" ] || return 0
+  printf '%s\n' "$1" >> "$marker" 2>/dev/null || true
+}
+
+trace_begin() {
+  valid_trace_id "$2" || return 0
+  trace_write "B|$$|$1/$2"
+}
+
+trace_end() {
+  valid_trace_id "$1" || return 0
+  trace_write "E|$$"
+}
+
+trace_instant() {
+  valid_trace_id "$2" || return 0
+  trace_write "I|$$|$1/$2|p"
+}
+
+set_trace_context() {
+  valid_trace_id "$1" || return 1
+  printf '%s\n' "$1" > "$TRACE_CONTEXT"
+  chmod 0600 "$TRACE_CONTEXT"
+}
+
+clear_trace_context() {
+  rm -f "$TRACE_CONTEXT"
+}
+
+control_lock_owner_alive() {
+  owner_pid=$1
+  owner_start=$2
+  [ -n "$owner_pid" ] && [ -n "$owner_start" ] || return 1
+  kill -0 "$owner_pid" 2>/dev/null || return 1
+  actual_start="$(awk '{print $22}' "/proc/$owner_pid/stat" 2>/dev/null)"
+  [ "$actual_start" = "$owner_start" ]
+}
+
+release_control_lock() {
+  [ "$CONTROL_LOCK_HELD" = true ] || return 0
+  owner_pid="$(cat "$CONTROL_LOCK/pid" 2>/dev/null)"
+  owner_start="$(cat "$CONTROL_LOCK/starttime" 2>/dev/null)"
+  if [ "$owner_pid" = "$$" ]; then
+    rm -rf "$CONTROL_LOCK"
+  fi
+  CONTROL_LOCK_HELD=false
+}
+
+cleanup_on_exit() {
+  clear_trace_context
+  release_control_lock
+}
+
+acquire_control_lock() {
+  [ "$CONTROL_LOCK_HELD" = true ] && return 0
+  count=0
+  while ! mkdir "$CONTROL_LOCK" 2>/dev/null; do
+    owner_pid="$(cat "$CONTROL_LOCK/pid" 2>/dev/null)"
+    owner_start="$(cat "$CONTROL_LOCK/starttime" 2>/dev/null)"
+    if [ -n "$owner_pid" ] && [ -n "$owner_start" ]; then
+      if ! control_lock_owner_alive "$owner_pid" "$owner_start"; then
+        rm -rf "$CONTROL_LOCK"
+        continue
+      fi
+    elif [ "$count" -gt 1 ]; then
+      rm -rf "$CONTROL_LOCK"
+      continue
+    fi
+    if [ "$count" -ge "$CONTROL_LOCK_TIMEOUT" ]; then
+      printf '%s\n' 'AkihaLink control operation is busy' >&2
+      return 1
+    fi
+    sleep 1
+    count=$((count + 1))
+  done
+  printf '%s\n' $$ > "$CONTROL_LOCK/pid"
+  awk '{print $22}' "/proc/$$/stat" > "$CONTROL_LOCK/starttime" 2>/dev/null
+  chmod 0600 "$CONTROL_LOCK/pid" "$CONTROL_LOCK/starttime"
+  CONTROL_LOCK_HELD=true
+  trap 'cleanup_on_exit' EXIT
+  trap 'cleanup_on_exit; exit 130' INT
+  trap 'cleanup_on_exit; exit 143' TERM
+}
+
+activation_transaction_value() {
+  key=$1
+  [ -r "$ACTIVATION_TRANSACTION" ] || return 1
+  sed -n "s/^$key=//p" "$ACTIVATION_TRANSACTION" | head -n 1
+}
+
+write_activation_transaction() {
+  was_running=$1
+  had_config=$2
+  previous_mode=$3
+  phase=$4
+  temporary="$ACTIVATION_TRANSACTION.tmp.$$"
+  {
+    printf 'was_running=%s\n' "$was_running"
+    printf 'had_config=%s\n' "$had_config"
+    printf 'previous_mode=%s\n' "$previous_mode"
+    printf 'phase=%s\n' "$phase"
+  } > "$temporary" || return 1
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$ACTIVATION_TRANSACTION"
+}
+
+clear_activation_transaction() {
+  rm -f "$ACTIVATION_TRANSACTION" "$ACTIVATION_BACKUP" \
+    "$ACTIVATION_TRANSACTION.tmp.$$"
+}
+
+. "$MODDIR/kernel-capabilities.sh"
+
+raw_alive() {
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null
+}
+
+process_starttime() {
+  cat "$1" 2>/dev/null
+}
+
+verified_process_alive() {
+  pid=$1
+  expected=$2
+  starttime=$3
+  [ -n "$pid" ] || return 1
+  "$CORE" akihalink-daemon process status "$pid" "$expected" "$starttime" >/dev/null 2>&1
+}
+
+core_alive() {
+  verified_process_alive "$1" "$CORE" "$(process_starttime "$RUNTIME/core.starttime")"
+}
+
+supervisor_alive() {
+  verified_process_alive "$1" "$CORE" "$(process_starttime "$RUNTIME/supervisor.starttime")"
+}
+
+core_pid() {
+  cat "$RUNTIME/core.pid" 2>/dev/null
+}
+
+supervisor_pid() {
+  cat "$RUNTIME/supervisor.pid" 2>/dev/null
+}
+
+observability_pid() {
+  cat "$RUNTIME/observability.pid" 2>/dev/null
+}
+
+observability_alive() {
+  pid=$1
+  verified_process_alive "$pid" "$CORE" "$(process_starttime "$RUNTIME/observability.starttime")" || return 1
+  [ -r "/proc/$pid/cmdline" ] && grep -Fq 'akihalink-daemon' "/proc/$pid/cmdline" 2>/dev/null
+}
+
+observability_client() {
+  "$CORE" akihalink-daemon --socket "$OBSERVABILITY_SOCKET" \
+    --pin-root "$OBSERVABILITY_PIN_ROOT" client "$@"
+}
+
+observability_probe_json() {
+  if observability_alive_fast "$(observability_pid)"; then
+    observability_client probe 2>/dev/null
+  else
+    "$CORE" akihalink-daemon probe 2>/dev/null
+  fi
+}
+
+observability_runtime_status_json() {
+  if observability_alive_fast "$(observability_pid)"; then
+    observability_client runtime-status 2>/dev/null
+  fi
+}
+
+set_observability_capabilities() {
+  payload=$1
+  values="$(printf '%s' "$payload" | awk '
+    { data = data $0 }
+    function json_value(key, kind, offset, value) {
+      offset = index(data, "\"" key "\"")
+      if (offset == 0) return "null"
+      value = substr(data, offset + length(key) + 2)
+      sub(/^[^:]*:[[:space:]]*/, "", value)
+      if (kind == "bool") {
+        if (value ~ /^true/) return "true"
+        if (value ~ /^false/) return "false"
+        return "null"
+      }
+      if (match(value, /^-?[0-9]+/)) return substr(value, RSTART, RLENGTH)
+      return "null"
+    }
+    END {
+      printf "%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s %s", \
+        json_value("btfRootReadable", "bool"), json_value("coreRelocation", "bool"), \
+        json_value("bpffs", "bool"), json_value("bpfLink", "bool"), \
+        json_value("linkUpdate", "bool"), json_value("ringBuffer", "bool"), \
+        json_value("sockOps", "bool"), json_value("tcpInfo", "bool"), \
+        json_value("rtnetlink", "bool"), json_value("perSocketPmtu", "bool"), \
+        json_value("perSocketMss", "bool"), json_value("quicDplpmtud", "bool"), \
+        json_value("pidfdOpen", "bool"), json_value("pidfdSendSignal", "bool"), \
+        json_value("pidfdPoll", "bool"), json_value("tcpMtuProbing", "number")
+    }
+  ')"
+  set -- $values
+  AKIHALINK_BTF_ROOT_READABLE=${1:-null}
+  AKIHALINK_CORE_RELOCATION=${2:-null}
+  AKIHALINK_BPFFS=${3:-null}
+  AKIHALINK_BPF_LINK=${4:-null}
+  AKIHALINK_BPF_LINK_UPDATE=${5:-null}
+  AKIHALINK_RING_BUFFER=${6:-null}
+  AKIHALINK_SOCK_OPS=${7:-null}
+  AKIHALINK_TCP_INFO=${8:-null}
+  AKIHALINK_RTNETLINK=${9:-null}
+  AKIHALINK_PER_SOCKET_PMTU=${10:-null}
+  AKIHALINK_PER_SOCKET_MSS=${11:-null}
+  AKIHALINK_QUIC_DPLPMTUD=${12:-null}
+  AKIHALINK_PIDFD_OPEN=${13:-null}
+  AKIHALINK_PIDFD_SEND_SIGNAL=${14:-null}
+  AKIHALINK_PIDFD_POLL=${15:-null}
+  AKIHALINK_TCP_MTU_PROBING=${16:-null}
+}
+
+cleanup_owned_redirect() {
+  "$CORE" akihalink-daemon --pin-root "$OBSERVABILITY_PIN_ROOT" cleanup-pins
+}
+
+cleanup_owned_shared_network() {
+  "$CORE" akihalink-daemon --runtime "$RUNTIME" cleanup-shared-network
+  rm -f "$HOTSPOT_STATE"
+}
+
+stop_observability() {
+  cleanup=${1:-false}
+  pid="$(observability_pid)"
+  if observability_alive "$pid"; then
+    if [ "$cleanup" = true ]; then
+      timeout 1s "$CORE" akihalink-daemon --socket "$OBSERVABILITY_SOCKET" \
+        --pin-root "$OBSERVABILITY_PIN_ROOT" client cleanup >/dev/null 2>&1 || true
+    else
+      timeout 1s "$CORE" akihalink-daemon --socket "$OBSERVABILITY_SOCKET" \
+        --pin-root "$OBSERVABILITY_PIN_ROOT" client stop >/dev/null 2>&1 || true
+    fi
+    count=0
+    while observability_alive "$pid" && [ "$count" -lt 5 ]; do
+      sleep 0.1
+      count=$((count + 1))
+    done
+    if observability_alive "$pid"; then
+      "$CORE" akihalink-daemon process signal "$pid" "$CORE" \
+        "$(process_starttime "$RUNTIME/observability.starttime")" 15 >/dev/null 2>&1 || true
+    fi
+    count=0
+    while observability_alive "$pid" && [ "$count" -lt 5 ]; do
+      sleep 0.1
+      count=$((count + 1))
+    done
+    if observability_alive "$pid"; then
+      "$CORE" akihalink-daemon process signal "$pid" "$CORE" \
+        "$(process_starttime "$RUNTIME/observability.starttime")" 9 >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "$RUNTIME/observability.pid" "$RUNTIME/observability.starttime" \
+    "$RUNTIME/supervisor.pid" "$RUNTIME/supervisor.starttime" "$OBSERVABILITY_SOCKET"
+}
+
+speedtest_pid() {
+  cat "$RUNTIME/speedtest.pid" 2>/dev/null
+}
+
+speedtest_alive() {
+  verified_process_alive "$1" "$CORE" "$(process_starttime "$RUNTIME/speedtest.starttime")"
+}
+
+speedtest_supervisor_pid() {
+  cat "$RUNTIME/speedtest.supervisor.pid" 2>/dev/null
+}
+
+speedtest_supervisor_alive() {
+  verified_process_alive "$1" "$CORE" \
+    "$(process_starttime "$RUNTIME/speedtest.supervisor.starttime")"
+}
+
+stop_speedtest() {
+  pid="$(speedtest_pid)"
+  spid="$(speedtest_supervisor_pid)"
+  if speedtest_supervisor_alive "$spid"; then
+    "$CORE" akihalink-daemon process signal "$spid" "$CORE" \
+      "$(process_starttime "$RUNTIME/speedtest.supervisor.starttime")" 15 >/dev/null 2>&1 || true
+    count=0
+    while speedtest_supervisor_alive "$spid" && [ "$count" -lt 20 ]; do
+      sleep 0.1
+      count=$((count + 1))
+    done
+    if speedtest_supervisor_alive "$spid"; then
+      "$CORE" akihalink-daemon process signal "$spid" "$CORE" \
+        "$(process_starttime "$RUNTIME/speedtest.supervisor.starttime")" 9 >/dev/null 2>&1 || true
+      count=0
+      while speedtest_supervisor_alive "$spid" && [ "$count" -lt 10 ]; do
+        sleep 0.1
+        count=$((count + 1))
+      done
+    fi
+  fi
+  if speedtest_alive "$pid"; then
+    "$CORE" akihalink-daemon process signal "$pid" "$CORE" \
+      "$(process_starttime "$RUNTIME/speedtest.starttime")" 15 >/dev/null 2>&1 || true
+    count=0
+    while speedtest_alive "$pid" && [ "$count" -lt 20 ]; do
+      sleep 0.1
+      count=$((count + 1))
+    done
+    if speedtest_alive "$pid"; then
+      "$CORE" akihalink-daemon process signal "$pid" "$CORE" \
+        "$(process_starttime "$RUNTIME/speedtest.starttime")" 9 >/dev/null 2>&1 || true
+      count=0
+      while speedtest_alive "$pid" && [ "$count" -lt 10 ]; do
+        sleep 0.1
+        count=$((count + 1))
+      done
+    fi
+  fi
+  if speedtest_supervisor_alive "$spid" || speedtest_alive "$pid"; then
+    printf '%s\n' 'Speed test process survived TERM and KILL' > "$SPEEDTEST_ERROR"
+    chmod 0600 "$SPEEDTEST_ERROR"
+    return 1
+  fi
+  if speedtest_socket_tables_available "$pid" && tcp_listener_ready "$pid" "$SPEEDTEST_PORT"; then
+    printf '%s\n' 'Speed test controller is still listening on 127.0.0.1:19090' > "$SPEEDTEST_ERROR"
+    chmod 0600 "$SPEEDTEST_ERROR"
+    return 1
+  fi
+  rm -f "$RUNTIME/speedtest.pid" "$RUNTIME/speedtest.starttime" \
+    "$RUNTIME/speedtest.supervisor.pid" "$RUNTIME/speedtest.supervisor.starttime" \
+    "$RUNTIME/speedtest.session" "$RUNTIME/speedtest.expires" "$SPEEDTEST_CONFIG" \
+    "$SPEEDTEST_READINESS"
+}
+
+speedtest_status_json() {
+  readiness_override=${1:-}
+  pid="$(speedtest_pid)"
+  had_pid=false
+  [ -n "$pid" ] && had_pid=true
+  if speedtest_alive "$pid"; then
+    running=true
+    pid_json=$pid
+  else
+    running=false
+    pid_json=null
+  fi
+  expires="$(cat "$RUNTIME/speedtest.expires" 2>/dev/null)"
+  [ -n "$expires" ] || expires=null
+  error_text="$(tail -c 2048 "$SPEEDTEST_ERROR" 2>/dev/null)"
+  if [ -z "$error_text" ] && ! $running && $had_pid; then
+    error_text="$(tail -c 2048 "$SPEEDTEST_LOG" 2>/dev/null)"
+  fi
+  if [ -n "$error_text" ]; then error_json="\"$(json_escape "$error_text")\""; else error_json=null; fi
+  readiness="$readiness_override"
+  [ -n "$readiness" ] || readiness="$(cat "$SPEEDTEST_READINESS" 2>/dev/null)"
+  case "$readiness" in
+    ready|unverified|failed) readiness_json="\"$readiness\"" ;;
+    *) readiness_json=null ;;
+  esac
+  printf '{"running":%s,"port":%s,"pid":%s,"expiresAt":%s,"readiness":%s,"lastError":%s}\n' \
+    "$running" "$SPEEDTEST_PORT" "$pid_json" "$expires" "$readiness_json" "$error_json"
+}
+
+tcp_listener_ready() {
+  pid=$1
+  port=$2
+  address=${3:-}
+  [ -n "$pid" ] && [ -n "$port" ] || return 1
+  port_hex="$(printf '%04X' "$port")"
+  proc_root=${AKIHALINK_TEST_PROC_ROOT:-/proc}
+  for table in \
+    "$proc_root/$pid/net/tcp" "$proc_root/$pid/net/tcp6" \
+    "$proc_root/net/tcp" "$proc_root/net/tcp6"; do
+    [ -r "$table" ] || continue
+    awk -v port="$port_hex" -v address="$address" '
+      $4 == "0A" {
+        separator = index($2, ":")
+        local_address = substr($2, 1, separator - 1)
+        local_port = substr($2, separator + 1)
+        if (local_port == port && (address == "" || local_address == address)) found = 1
+      }
+      END { if (!found) exit 1 }
+    ' "$table" && return 0
+  done
+  return 1
+}
+
+main_api_ready() {
+  tcp_listener_ready "$1" "$MAIN_API_PORT" 0100007F
+}
+
+system_resolver_process_ready() {
+  process_root=$1
+  [ -d "$process_root" ] || return 1
+  [ -r "$process_root/comm" ] || return 1
+  process_name="$(tr -d '\r\n' < "$process_root/comm" 2>/dev/null)"
+  case "$process_name" in
+    netd|Binder:netd) ;;
+    *) return 1 ;;
+  esac
+  [ -r "$process_root/status" ] || return 1
+  uid="$(awk '$1 == "Uid:" { print $2; exit }' "$process_root/status" 2>/dev/null)"
+  [ "$uid" = 0 ] || return 1
+  executable="$(readlink "$process_root/exe" 2>/dev/null)"
+  executable="${executable% (deleted)}"
+  [ "${executable##*/}" = netd ] || return 1
+  [ -r "$process_root/cmdline" ] || return 1
+  command="$(tr '\000' '\n' < "$process_root/cmdline" 2>/dev/null | sed -n '1p')"
+  [ "${command##*/}" = netd ]
+}
+
+system_resolver_ready() {
+  proc_root=${AKIHALINK_TEST_PROC_ROOT:-/proc}
+  if [ "$proc_root" = /proc ]; then
+    resolver_pids="$(pidof netd 2>/dev/null)"
+    for resolver_pid in $resolver_pids; do
+      system_resolver_process_ready "$proc_root/$resolver_pid" && return 0
+    done
+    return 1
+  fi
+  for process_root in "$proc_root"/[0-9]*; do
+    system_resolver_process_ready "$process_root" && return 0
+  done
+  return 1
+}
+
+core_ready() {
+  pid=$1
+  core_ready_from_marker "$pid"
+}
+
+# The core writes this marker only after the eBPF inbound has verified and
+# attached the Android resolver.  Status reads must not rescan every process
+# or launch another full sing-box binary after a stop or UID-map hot update.
+pid_matches_starttime() {
+  pid=$1
+  expected_starttime=$2
+  case "$pid:$expected_starttime" in
+    *[!0-9:]*|:*) return 1 ;;
+  esac
+  stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+  stat="${stat##*) }"
+  set -- $stat
+  [ "${20:-}" = "$expected_starttime" ]
+}
+
+core_alive_fast() {
+  pid_matches_starttime "$1" "$(process_starttime "$RUNTIME/core.starttime")"
+}
+
+supervisor_alive_fast() {
+  pid_matches_starttime "$1" "$(process_starttime "$RUNTIME/supervisor.starttime")"
+}
+
+observability_alive_fast() {
+  pid=$1
+  pid_matches_starttime "$pid" "$(process_starttime "$RUNTIME/observability.starttime")" || return 1
+  [ -r "/proc/$pid/cmdline" ] && grep -Fq 'akihalink-daemon' "/proc/$pid/cmdline" 2>/dev/null
+}
+
+core_ready_from_marker() {
+  pid=$1
+  marker_pid="$(startup_readiness_value pid)"
+  marker_starttime="$(startup_readiness_value starttime)"
+  [ "$pid" = "$marker_pid" ] || return 1
+  pid_matches_starttime "$pid" "$marker_starttime" || return 1
+  [ "$(startup_readiness_value controller_authenticated)" = 1 ] || return 1
+  [ "$(startup_readiness_value startup_health)" = healthy ] || return 1
+  [ "$(startup_readiness_value system_resolver_attached)" = 1 ]
+}
+
+startup_readiness_value() {
+  key=$1
+  [ -r "$STARTUP_READINESS" ] || return 1
+  sed -n "s/^$key=//p" "$STARTUP_READINESS" | head -n 1
+}
+
+readiness_value() {
+  key=$1
+  [ -r "$CORE_READINESS" ] || return 1
+  sed -n "s/^$key=//p" "$CORE_READINESS" | head -n 1
+}
+
+readiness_count() {
+  value="$(readiness_value "$1")"
+  case "$value" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$value" ;; esac
+}
+
+active_dns_netids() {
+  dumpsys dnsresolver 2>/dev/null | awk '
+    match($0, /[Nn]et[Ii]d[^0-9]*[0-9]+/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^[^0-9]*/, "", value)
+      if (!seen[value]++) print value
+      next
+    }
+    match($0, /Network[[:space:]]+[0-9]+/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^[^0-9]*/, "", value)
+      if (!seen[value]++) print value
+    }
+  '
+}
+
+flush_android_dns_cache() {
+  netids="$(active_dns_netids)"
+  [ -n "$netids" ] || {
+    printf '%s\n' degraded > "$DNS_CACHE_FLUSH_STATUS"
+    return 1
+  }
+  count=0
+  for netid in $netids; do
+    case "$netid" in ''|*[!0-9]*) continue ;; esac
+    response="$(service call dnsresolver 11 i32 "$netid" 2>&1)" || {
+      printf '%s\n' degraded > "$DNS_CACHE_FLUSH_STATUS"
+      return 1
+    }
+    printf '%s' "$response" | grep -Eqi 'Exception|Unknown transaction|SecurityException' && {
+      printf '%s\n' degraded > "$DNS_CACHE_FLUSH_STATUS"
+      return 1
+    }
+    printf '%s' "$response" | grep -q 'Parcel' || {
+      printf '%s\n' degraded > "$DNS_CACHE_FLUSH_STATUS"
+      return 1
+    }
+    count=$((count + 1))
+  done
+  [ "$count" -gt 0 ] || {
+    printf '%s\n' degraded > "$DNS_CACHE_FLUSH_STATUS"
+    return 1
+  }
+  printf '%s\n' ok > "$DNS_CACHE_FLUSH_STATUS"
+  chmod 0600 "$DNS_CACHE_FLUSH_STATUS"
+}
+
+speedtest_api_ready() {
+  pid=$1
+  tcp_listener_ready "$pid" "$SPEEDTEST_PORT" && return 0
+  # Keep compatibility with older cores and the controller fixture.
+  grep -q "restful api listening at 127.0.0.1:$SPEEDTEST_PORT" "$SPEEDTEST_LOG"
+}
+
+speedtest_socket_tables_available() {
+  pid=$1
+  proc_root=${AKIHALINK_TEST_PROC_ROOT:-/proc}
+  for table in \
+    "$proc_root/$pid/net/tcp" "$proc_root/$pid/net/tcp6" \
+    "$proc_root/net/tcp" "$proc_root/net/tcp6"; do
+    [ -r "$table" ] && return 0
+  done
+  return 1
+}
+
+set_speedtest_readiness() {
+  case "$1" in ready|unverified) ;; *) return 1 ;; esac
+  printf '%s\n' "$1" > "$SPEEDTEST_READINESS"
+  chmod 0600 "$SPEEDTEST_READINESS"
+}
+
+start_speedtest() {
+  source=$1
+  [ -f "$source" ] || { printf '%s\n' 'Staged speed test config does not exist' >&2; return 2; }
+  if core_alive "$(core_pid)" || supervisor_alive "$(supervisor_pid)"; then
+    printf '%s\n' 'Main core is running; use its Clash API' >&2
+    return 2
+  fi
+  candidate="$RUNTIME/speedtest.candidate.$$"
+  cp "$source" "$candidate" || return 2
+  chmod 0600 "$candidate"
+  if grep -q '"inbounds"[[:space:]]*:' "$candidate"; then
+    printf '%s\n' 'Speed test configuration must not contain inbounds' >&2
+    rm -f "$candidate"
+    return 2
+  fi
+  if ! grep -q '"external_controller"[[:space:]]*:[[:space:]]*"127\.0\.0\.1:19090"' "$candidate"; then
+    printf '%s\n' 'Speed test controller must listen on 127.0.0.1:19090' >&2
+    rm -f "$candidate"
+    return 2
+  fi
+  if grep -Eq '"type"[[:space:]]*:[[:space:]]*"(ebpf|tun|tproxy)"' "$candidate"; then
+    printf '%s\n' 'Speed test configuration contains a forbidden inbound type' >&2
+    rm -f "$candidate"
+    return 2
+  fi
+  "$CORE" check -c "$candidate" > "$RUNTIME/speedtest.check.log" 2>&1 || {
+    cat "$RUNTIME/speedtest.check.log" >&2
+    rm -f "$candidate"
+    return 2
+  }
+
+  stop_speedtest || return 1
+  mv -f "$candidate" "$SPEEDTEST_CONFIG"
+  chmod 0600 "$SPEEDTEST_CONFIG"
+  : > "$SPEEDTEST_LOG"
+  rm -f "$SPEEDTEST_ERROR"
+  chmod 0600 "$SPEEDTEST_LOG"
+  "$CORE" akihalink-daemon --core "$CORE" --runtime "$RUNTIME" \
+    auxiliary --timeout "${SPEEDTEST_TIMEOUT_SECONDS}s" \
+    speedtest "$SPEEDTEST_CONFIG" "$SPEEDTEST_LOG" >/dev/null 2>&1 &
+  count=0
+  while [ "$count" -lt 5 ] && [ ! -s "$RUNTIME/speedtest.pid" ]; do
+    sleep 1
+    count=$((count + 1))
+  done
+  pid="$(speedtest_pid)"
+
+  count=0
+  while [ "$count" -lt 2 ]; do
+    if speedtest_api_ready "$pid"; then break; fi
+    speedtest_alive "$pid" || break
+    sleep 1
+    count=$((count + 1))
+  done
+  if ! speedtest_alive "$pid"; then
+    tail -c 4096 "$SPEEDTEST_LOG" > "$SPEEDTEST_ERROR"
+    [ -s "$SPEEDTEST_ERROR" ] || \
+      printf '%s\n' 'Speed test core exited before the controller became ready' > "$SPEEDTEST_ERROR"
+    stop_speedtest
+    printf '%s\n' 'Speed test core failed to start' >&2
+    return 1
+  fi
+
+  if speedtest_api_ready "$pid"; then
+    set_speedtest_readiness ready
+  elif speedtest_socket_tables_available "$pid"; then
+    printf '%s\n' 'Speed test controller did not listen on 127.0.0.1:19090' > "$SPEEDTEST_ERROR"
+    chmod 0600 "$SPEEDTEST_ERROR"
+    stop_speedtest
+    printf '%s\n' 'Speed test controller failed readiness verification' >&2
+    return 1
+  else
+    # Some ROMs hide socket tables from the module shell. The App will perform
+    # the authenticated HTTP readiness check before issuing delay requests.
+    set_speedtest_readiness unverified
+  fi
+
+  now="$(date +%s)"
+  expires=$((now + SPEEDTEST_TIMEOUT_SECONDS))
+  printf '%s\n' "$expires" > "$RUNTIME/speedtest.expires"
+  chmod 0600 "$RUNTIME/speedtest.expires"
+}
+
+cleanup_routes() {
+  ip route del local 127.128.0.0/9 dev lo table local 2>/dev/null || true
+  ip -6 route del local fd53:696e:672d:626f::/64 dev lo table local 2>/dev/null || true
+}
+
+stop_processes() {
+  stop_observability true
+  # Main cilium objects are FD-owned. This only removes stale v14 redirect pins.
+  cleanup_owned_redirect >> "$OBSERVABILITY_LOG" 2>&1 || true
+  cleanup_owned_shared_network >> "$OBSERVABILITY_LOG" 2>&1 || true
+  rm -f "$RUNTIME/core.pid" "$RUNTIME/core.starttime" "$RUNTIME/started_at" \
+    "$CORE_READINESS" "$STARTUP_READINESS" "$DNS_CACHE_FLUSH_STATUS"
+  cleanup_routes
+}
+
+# Application exclusions are the only mutable part of AkihaLink's eBPF UID
+# policy. The core performs a canonical Go-side comparison of decoded v15
+# configurations so formatting or key order cannot weaken the update gate.
+same_config_except_ebpf_exclusions() {
+  "$CORE" akihalink-daemon compare-config-except-uid "$1" "$2" \
+    >> "$OBSERVABILITY_LOG" 2>&1
+}
+
+uid_policy_status_json() {
+  policy_pid="$(core_pid)"
+  if core_alive_fast "$policy_pid"; then
+    policy_status="$(timeout 4s "$CORE" akihalink-daemon \
+      --uid-policy-socket "$UID_POLICY_SOCKET" uid-policy-status 2>/dev/null)"
+    if [ -n "$policy_status" ]; then
+      printf '%s\n' "$policy_status"
+      return 0
+    fi
+  fi
+  printf '%s\n' '{"generation":0,"configuredFingerprint":"","liveFingerprint":"","effectiveUids":0,"tcpBypassHits":0,"udpBypassHits":0,"inSync":false,"known":false}'
+}
+
+uid_policy_apply_result_json() {
+  runtime_status="$(status_json true false true)"
+  policy_status="$(uid_policy_status_json)"
+  reset_status=${UID_POLICY_CONNECTION_RESET:-'{"requestedPackages":0,"stoppedPackages":0,"verifiedUids":0,"remainingUids":[]}'}
+  printf '{"runningStatus":%s,"policyStatus":%s,"connectionReset":%s}\n' \
+    "$runtime_status" "$policy_status" "$reset_status"
+}
+
+write_probe_config() {
+  probe_config=$1
+  cat > "$probe_config" <<'EOF'
+{
+  "log": {"level": "info", "timestamp": true},
+  "dns": {
+    "servers": [{
+      "type": "udp",
+      "tag": "probe-dns",
+      "server": "127.0.0.1",
+      "server_port": 53
+    }],
+    "final": "probe-dns"
+  },
+  "inbounds": [{
+    "type": "ebpf",
+    "tag": "probe-in",
+    "mode": "local",
+    "network": ["tcp", "udp"],
+    "local": {
+      "dns_mode": "hijack",
+      "include_uid": [4294967294],
+      "include_uid_range": [],
+      "exclude_uid": []
+    }
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"final": "direct", "auto_detect_interface": true}
+}
+EOF
+  chmod 0600 "$probe_config"
+}
+
+write_hotspot_probe_config() {
+  probe_config=$1
+  probe_interface=$2
+  printf '%s' "$probe_interface" | grep -Eq '^aklp[0-9]{1,10}$' || return 1
+  cat > "$probe_config" <<EOF
+{
+  "log": {"level": "info", "timestamp": true},
+  "dns": {
+    "servers": [{
+      "type": "udp",
+      "tag": "hotspot-probe-dns",
+      "server": "127.0.0.1",
+      "server_port": 53
+    }],
+    "final": "hotspot-probe-dns"
+  },
+  "inbounds": [{
+    "type": "ebpf",
+    "tag": "hotspot-probe-in",
+    "mode": "shared",
+    "network": ["tcp", "udp"],
+    "shared": {
+      "dns_mode": "off",
+      "interface": ["$probe_interface"],
+      "advanced": {
+        "tc_priority": 1,
+        "data_plane": "rewrite"
+      }
+    }
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"final": "direct", "auto_detect_interface": true}
+}
+EOF
+  chmod 0600 "$probe_config"
+}
+
+hotspot_probe_ready() {
+  grep -Eq 'eBPF shared-network (TC interception ready|waiting for downstream interfaces)' "$1"
+}
+
+hotspot_probe_signature() {
+  boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+  core_version="$($CORE version 2>/dev/null | sed -n '1p')"
+  printf '%s|%s' "$boot_id" "$core_version"
+}
+
+ebpf_probe_ready() {
+  # sing-box 1.14 reports successful cgroup interception with this marker.
+  # The pre-upgrade backend used "eBPF inbound attached", which no longer
+  # appears even when the upstream eBPF inbound is ready.
+  grep -q 'eBPF local cgroup interception ready' "$1"
+}
+
+terminate_probe() {
+  probe_pid=$1
+  helper_pid="$(cat "$RUNTIME/cleanup.supervisor.pid" 2>/dev/null)"
+  helper_start="$(cat "$RUNTIME/cleanup.supervisor.starttime" 2>/dev/null)"
+  if verified_process_alive "$helper_pid" "$CORE" "$helper_start"; then
+    "$CORE" akihalink-daemon process signal "$helper_pid" "$CORE" \
+      "$helper_start" 15 >/dev/null 2>&1 || true
+    count=0
+    while verified_process_alive "$helper_pid" "$CORE" "$helper_start" &&
+      [ "$count" -lt 6 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+  fi
+  if verified_process_alive "$probe_pid" "$CORE" \
+    "$(cat "$RUNTIME/cleanup.starttime" 2>/dev/null)"; then
+    "$CORE" akihalink-daemon process signal "$probe_pid" "$CORE" \
+      "$(cat "$RUNTIME/cleanup.starttime" 2>/dev/null)" 15 >/dev/null 2>&1 || true
+  fi
+  rm -f "$RUNTIME/cleanup.pid" "$RUNTIME/cleanup.starttime" \
+    "$RUNTIME/cleanup.supervisor.pid" "$RUNTIME/cleanup.supervisor.starttime"
+}
+
+detach_stale() {
+  # The core can now remove verified persistent redirect pins directly. The
+  # previous disposable-core probe added several seconds to every restart.
+  cleanup_owned_redirect >> "$OBSERVABILITY_LOG" 2>&1 || true
+  cleanup_routes
+}
+
+start_core() {
+  trace_id=${1:-}
+  prevalidated=${2:-false}
+  valid_trace_id "$trace_id" && set_trace_context "$trace_id"
+  stop_speedtest
+  [ -f "$CONFIG_DIR/current.json" ] || {
+    printf '%s\n' 'No applied configuration' > "$RUNTIME/last_error"
+    clear_trace_context
+    return 1
+  }
+  if ! "$CORE" akihalink-daemon migrate-config "$CONFIG_DIR/current.json" \
+    >> "$OBSERVABILITY_LOG" 2> "$RUNTIME/config-migration.error"; then
+    tail -c 2048 "$RUNTIME/config-migration.error" > "$RUNTIME/last_error" 2>/dev/null || true
+    chmod 0600 "$RUNTIME/last_error" 2>/dev/null
+    clear_trace_context
+    return 1
+  fi
+  rm -f "$RUNTIME/config-migration.error"
+  if contains_removed_android_system_resolver_option "$CONFIG_DIR/current.json"; then
+    legacy_config_error > "$RUNTIME/last_error"
+    chmod 0600 "$RUNTIME/last_error"
+    clear_trace_context
+    return 1
+  fi
+  if [ "$prevalidated" != true ]; then
+    "$CORE" check -c "$CONFIG_DIR/current.json" > "$RUNTIME/check.log" 2>&1 || {
+      cp -f "$RUNTIME/check.log" "$RUNTIME/last_error"
+      clear_trace_context
+      return 1
+    }
+  fi
+  pid="$(core_pid)"
+  if core_ready "$pid"; then
+    printf '%s\n' running > "$RUNTIME/desired"
+    printf '%s\n' running > "$RUNTIME/actual"
+    rm -f "$RUNTIME/last_error"
+    clear_trace_context
+    return 0
+  fi
+  spid="$(supervisor_pid)"
+  printf '%s\n' running > "$RUNTIME/desired"
+  printf '%s\n' starting > "$RUNTIME/actual"
+  rm -f "$RUNTIME/last_error"
+  if ! supervisor_alive "$spid"; then
+    trace_begin AKL/supervisor_wake "$trace_id"
+    "$SUPERVISOR" >/dev/null 2>&1 &
+    trace_end "$trace_id"
+  fi
+  count=0
+  ready_samples=0
+  max_attempts=$(( $STARTUP_WAIT_SECONDS * $STARTUP_POLL_PER_SECOND ))
+  while [ "$count" -lt "$max_attempts" ]; do
+    pid="$(core_pid)"
+    if core_ready "$pid"; then
+      ready_samples=$((ready_samples + 1))
+      if [ "$ready_samples" -ge 2 ]; then
+        flush_android_dns_cache >/dev/null 2>&1 || true
+        printf '%s\n' running > "$RUNTIME/actual"
+        trace_instant AKL/core_ready "$trace_id"
+        clear_trace_context
+        return 0
+      fi
+    else
+      ready_samples=0
+    fi
+    [ "$(cat "$RUNTIME/desired" 2>/dev/null)" = running ] || break
+    sleep "$STARTUP_POLL_SECONDS"
+    count=$((count + 1))
+  done
+  if [ ! -s "$RUNTIME/last_error" ]; then
+    pid="$(core_pid)"
+    if core_alive "$pid"; then
+      printf '%s\n' 'Core startup health timed out before all critical readiness checks passed' \
+        > "$RUNTIME/last_error"
+    else
+      printf '%s\n' 'Core exited before the local controller became ready' > "$RUNTIME/last_error"
+    fi
+    chmod 0600 "$RUNTIME/last_error"
+  fi
+  printf '%s\n' failed > "$RUNTIME/actual"
+  clear_trace_context
+  return 1
+}
+
+stop_failed_start() {
+  printf '%s\n' stopped > "$RUNTIME/desired"
+  stop_processes
+  printf '%s\n' failed > "$RUNTIME/actual"
+}
+
+stop_core() {
+  clear_trace_context
+  printf '%s\n' stopped > "$RUNTIME/desired"
+  stop_processes
+  printf '%s\n' stopped > "$RUNTIME/actual"
+}
+
+activation_result_json() {
+  outcome=$1
+  failure_stage=${2:-}
+  rolled_back=${3:-false}
+  if [ -n "$failure_stage" ]; then
+    failure_json="\"$(json_escape "$failure_stage")\""
+  else
+    failure_json=null
+  fi
+  activation_status="$(status_json true false true)"
+  printf '{"status":%s,"outcome":"%s","failureStage":%s,"rolledBack":%s}\n' \
+    "$activation_status" "$outcome" "$failure_json" "$rolled_back"
+}
+
+restore_activation_backup() {
+  had_config=$1
+  previous_mode=$2
+  if [ "$had_config" = true ] && [ -f "$ACTIVATION_BACKUP" ]; then
+    atomic_copy "$ACTIVATION_BACKUP" "$CONFIG_DIR/current.json" || return 1
+  else
+    rm -f "$CONFIG_DIR/current.json"
+  fi
+  case "$previous_mode" in
+    global|rule|direct) printf '%s\n' "$previous_mode" > "$RUNTIME/mode" ;;
+    *) printf '%s\n' rule > "$RUNTIME/mode" ;;
+  esac
+}
+
+recover_interrupted_activation() {
+  [ -f "$ACTIVATION_TRANSACTION" ] || return 0
+  was_running="$(activation_transaction_value was_running)"
+  had_config="$(activation_transaction_value had_config)"
+  previous_mode="$(activation_transaction_value previous_mode)"
+  case "$was_running" in true|false) ;; *) was_running=false ;; esac
+  case "$had_config" in true|false) ;; *) had_config=false ;; esac
+
+  printf '%s\n' stopped > "$RUNTIME/desired"
+  stop_processes
+  if ! restore_activation_backup "$had_config" "$previous_mode"; then
+    printf '%s\n' 'Interrupted activation could not restore the previous configuration' \
+      > "$RUNTIME/last_error"
+    chmod 0600 "$RUNTIME/last_error"
+    printf '%s\n' failed > "$RUNTIME/actual"
+    return 1
+  fi
+  clear_activation_transaction
+  if [ "$was_running" = true ] && [ "$had_config" = true ]; then
+    printf '%s\n' running > "$RUNTIME/desired"
+    if ! start_core; then
+      stop_failed_start
+      return 1
+    fi
+  else
+    printf '%s\n' stopped > "$RUNTIME/desired"
+    printf '%s\n' stopped > "$RUNTIME/actual"
+  fi
+}
+
+activate_config() {
+  source=$1
+  trace_id=${2:-}
+  valid_trace_id "$trace_id" && set_trace_context "$trace_id"
+  [ -f "$source" ] || {
+    printf '%s\n' 'Staged config does not exist' > "$RUNTIME/last_error"
+    activation_result_json rejected validation false
+    clear_trace_context
+    return 2
+  }
+  candidate="$CONFIG_DIR/activation.candidate.$$"
+  cp "$source" "$candidate" || {
+    printf '%s\n' 'Unable to stage activation configuration' > "$RUNTIME/last_error"
+    activation_result_json rejected commit false
+    clear_trace_context
+    return 2
+  }
+  chmod 0600 "$candidate"
+  if contains_removed_android_system_resolver_option "$candidate"; then
+    legacy_config_error > "$RUNTIME/last_error"
+    rm -f "$candidate"
+    activation_result_json rejected validation false
+    clear_trace_context
+    return 2
+  fi
+  trace_begin AKL/config_check "$trace_id"
+  if ! "$CORE" check -c "$candidate" > "$RUNTIME/check.log" 2>&1; then
+    trace_end "$trace_id"
+    printf '%s\n' 'Configuration validation failed' > "$RUNTIME/last_error"
+    rm -f "$candidate"
+    activation_result_json rejected validation false
+    clear_trace_context
+    return 2
+  fi
+  trace_end "$trace_id"
+  if ! grep -q '"type"[[:space:]]*:[[:space:]]*"ebpf"' "$candidate" ||
+    grep -Eq '"type"[[:space:]]*:[[:space:]]*"(tun|tproxy)"' "$candidate" ||
+    ! grep -q '"external_controller"[[:space:]]*:[[:space:]]*"127\.0\.0\.1:9090"' "$candidate"; then
+    printf '%s\n' 'Activation configuration violates the private eBPF controller policy' \
+      > "$RUNTIME/last_error"
+    rm -f "$candidate"
+    activation_result_json rejected validation false
+    clear_trace_context
+    return 2
+  fi
+
+  was_running=false
+  if [ "$(cat "$RUNTIME/desired" 2>/dev/null)" = running ] ||
+    core_alive "$(core_pid)" || supervisor_alive "$(supervisor_pid)"; then
+    was_running=true
+  fi
+  if [ "$was_running" = true ] && [ -f "$CONFIG_DIR/current.json" ] &&
+    cmp -s "$CONFIG_DIR/current.json" "$candidate" && core_ready_from_marker "$(core_pid)"; then
+    rm -f "$candidate" "$RUNTIME/last_error"
+    activation_result_json already_running '' false
+    clear_trace_context
+    return 0
+  fi
+
+  previous_mode="$(cat "$RUNTIME/mode" 2>/dev/null || printf rule)"
+  had_config=false
+  if [ -f "$CONFIG_DIR/current.json" ]; then
+    had_config=true
+    if ! atomic_copy "$CONFIG_DIR/current.json" "$ACTIVATION_BACKUP" ||
+      ! atomic_copy "$CONFIG_DIR/current.json" "$CONFIG_DIR/previous.json"; then
+      printf '%s\n' 'Unable to back up the previous configuration' > "$RUNTIME/last_error"
+      rm -f "$candidate"
+      clear_activation_transaction
+      activation_result_json rejected commit false
+      clear_trace_context
+      return 2
+    fi
+  else
+    rm -f "$ACTIVATION_BACKUP"
+  fi
+  if ! write_activation_transaction "$was_running" "$had_config" "$previous_mode" prepared; then
+    printf '%s\n' 'Unable to create activation transaction' > "$RUNTIME/last_error"
+    rm -f "$candidate"
+    clear_activation_transaction
+    activation_result_json rejected commit false
+    clear_trace_context
+    return 2
+  fi
+
+  if [ "$was_running" = true ]; then
+    printf '%s\n' stopped > "$RUNTIME/desired"
+    stop_processes
+  else
+    rm -f "$DATA/cache.db"
+  fi
+  trace_begin AKL/config_commit "$trace_id"
+  if ! mv -f "$candidate" "$CONFIG_DIR/current.json"; then
+    trace_end "$trace_id"
+    printf '%s\n' 'Unable to commit activation configuration' > "$RUNTIME/last_error"
+    restore_activation_backup "$had_config" "$previous_mode" || true
+    clear_activation_transaction
+    activation_result_json rejected commit false
+    clear_trace_context
+    return 2
+  fi
+  chmod 0600 "$CONFIG_DIR/current.json" "$CONFIG_DIR/previous.json" 2>/dev/null
+  if grep -q 'geoip-cn' "$CONFIG_DIR/current.json"; then
+    printf '%s\n' rule > "$RUNTIME/mode"
+  else
+    printf '%s\n' global > "$RUNTIME/mode"
+  fi
+  write_activation_transaction "$was_running" "$had_config" "$previous_mode" committed || true
+  trace_end "$trace_id"
+
+  printf '%s\n' running > "$RUNTIME/desired"
+  if start_core "$trace_id" true; then
+    outcome=started
+    [ "$was_running" = true ] && outcome=restarted
+    clear_activation_transaction
+    activation_result_json "$outcome" '' false
+    clear_trace_context
+    return 0
+  fi
+
+  printf '%s\n' stopped > "$RUNTIME/desired"
+  stop_processes
+  if ! restore_activation_backup "$had_config" "$previous_mode"; then
+    printf '%s\n' failed > "$RUNTIME/actual"
+    activation_result_json failed_clean cleanup false
+    clear_trace_context
+    return 3
+  fi
+  clear_activation_transaction
+  if [ "$was_running" = true ] && [ "$had_config" = true ]; then
+    printf '%s\n' running > "$RUNTIME/desired"
+    if start_core; then
+      activation_result_json rolled_back startup_readiness true
+      clear_trace_context
+      return 3
+    fi
+    stop_failed_start
+    activation_result_json failed_clean cleanup true
+    clear_trace_context
+    return 3
+  fi
+  printf '%s\n' stopped > "$RUNTIME/desired"
+  printf '%s\n' failed > "$RUNTIME/actual"
+  activation_result_json rolled_back startup_readiness "$had_config"
+  clear_trace_context
+  return 3
+}
+
+status_json() {
+  fast_mode=${1:-false}
+  diagnostic_mode=${2:-false}
+  health_mode=${3:-false}
+  desired="$(cat "$RUNTIME/desired" 2>/dev/null || printf stopped)"
+  mode="$(cat "$RUNTIME/mode" 2>/dev/null || printf rule)"
+  pid="$(core_pid)"
+  recorded_actual="$(cat "$RUNTIME/actual" 2>/dev/null || printf stopped)"
+  live_health_ready=false
+  if core_ready_from_marker "$pid"; then
+    actual=running
+    pid_json=$pid
+    live_health_ready=true
+  elif [ "$health_mode" = true ] && [ "$recorded_actual" = running ] && core_ready "$pid"; then
+    # The marker is an optimization, not the sole source of truth. It may be
+    # removed during a control transition while the verified runtime survives.
+    actual=running
+    pid_json=$pid
+    live_health_ready=true
+  elif [ "$recorded_actual" = running ] && core_alive_fast "$pid"; then
+    actual=running
+    pid_json=$pid
+  elif core_alive_fast "$pid" || supervisor_alive_fast "$(supervisor_pid)"; then
+    actual=starting
+    pid_json=null
+  else
+    actual="$recorded_actual"
+    case "$actual" in running|starting) actual=stopped ;; esac
+    pid_json=null
+  fi
+  if [ "$diagnostic_mode" = true ]; then pid_json=null; fi
+  started="$(cat "$RUNTIME/started_at" 2>/dev/null)"
+  [ -n "$started" ] || started=null
+  if [ "$actual" = running ] &&
+    grep -q '"type"[[:space:]]*:[[:space:]]*"ebpf"' "$CONFIG_DIR/current.json" 2>/dev/null; then
+    attached=true
+  else
+    attached=false
+  fi
+  if [ "$actual" = running ] &&
+    grep -q '"android_tethering"[[:space:]]*:[[:space:]]*"wifi"' "$CONFIG_DIR/current.json" 2>/dev/null; then
+    hotspot_state="$(cat "$HOTSPOT_STATE" 2>/dev/null)"
+    case "$hotspot_state" in
+      waiting|attached|failed) ;;
+      *) hotspot_state=waiting ;;
+    esac
+  else
+    hotspot_state=disabled
+  fi
+  if [ "$actual" = running ] && [ "$live_health_ready" = true ]; then
+    system_resolver_attached=true
+  elif [ "$actual" = running ] && [ "$(startup_readiness_value system_resolver_attached)" = 1 ]; then
+    # The supervisor marker remains authoritative while the core marker is
+    # being refreshed during a control transition.
+    system_resolver_attached=true
+  elif [ "$actual" = running ] && [ "$(readiness_value system_resolver_attached)" = 1 ]; then
+    system_resolver_attached=true
+  else
+    system_resolver_attached=false
+  fi
+  if [ "$health_mode" = true ] && [ "$actual" = running ]; then
+    if main_api_ready "$pid"; then controller_ready=true; else controller_ready=false; fi
+  else
+    controller_ready=null
+  fi
+  dns_cache_flush="$(cat "$DNS_CACHE_FLUSH_STATUS" 2>/dev/null)"
+  case "$dns_cache_flush" in
+    ok) startup_health=healthy ;;
+    degraded) startup_health=degraded ;;
+    *)
+      if [ "$actual" = running ]; then
+        dns_cache_flush=degraded
+        startup_health=degraded
+      elif [ "$actual" = starting ]; then
+        dns_cache_flush=pending
+        startup_health=checking
+      else
+        dns_cache_flush=not_run
+        startup_health="$actual"
+      fi
+      ;;
+  esac
+  resolver_discovered="$(readiness_count resolver_discovered)"
+  dns_plain_capture="$(readiness_count dns_plain_capture)"
+  dns_over_tls_capture="$(readiness_count dns_over_tls_capture)"
+  dns_over_https_capture="$(readiness_count dns_over_https_capture)"
+  probe_bypass="$(readiness_count probe_bypass)"
+  error_text="$(tail -c 2048 "$RUNTIME/last_error" 2>/dev/null)"
+  if [ -n "$error_text" ]; then error_json="\"$(json_escape "$error_text")\""; else error_json=null; fi
+  if [ "$diagnostic_mode" = true ]; then error_json=null; fi
+  if [ "$fast_mode" = true ]; then
+    core_version=
+    telemetry=
+    path_payload=
+  else
+    core_version="$($CORE version 2>/dev/null | head -n 1)"
+    runtime_status="$(observability_runtime_status_json)"
+    telemetry="$runtime_status"
+    path_payload="$runtime_status"
+  fi
+  if [ -n "$telemetry" ]; then
+    daemon_state=running
+    loader_mode="$(printf '%s' "$telemetry" | sed -n 's/.*"loaderMode":"\([^"]*\)".*/\1/p')"
+    attach_mode="$(printf '%s' "$telemetry" | sed -n 's/.*"attachMode":"\([^"]*\)".*/\1/p')"
+    event_mode="$(printf '%s' "$telemetry" | sed -n 's/.*"eventMode":"\([^"]*\)".*/\1/p')"
+    generation="$(printf '%s' "$telemetry" | sed -n 's/.*"pinGeneration":\([0-9][0-9]*\).*/\1/p')"
+	elif [ "$fast_mode" = true ] && observability_alive_fast "$(observability_pid)"; then
+	  daemon_state=running
+	  loader_mode=unavailable
+	  attach_mode=unavailable
+	  event_mode=unavailable
+	  generation=0
+  else
+    daemon_state=stopped
+    loader_mode=unavailable
+    attach_mode=none
+    event_mode=none
+    generation=0
+  fi
+  if [ -n "$telemetry" ]; then
+	resolver_discovered="$(printf '%s' "$telemetry" | sed -n 's/.*"systemResolverDiscovered":\([0-9][0-9]*\).*/\1/p')"
+	dns_plain_capture="$(printf '%s' "$telemetry" | sed -n 's/.*"dnsPlainCaptureCount":\([0-9][0-9]*\).*/\1/p')"
+	dns_over_tls_capture="$(printf '%s' "$telemetry" | sed -n 's/.*"dnsOverTlsCaptureCount":\([0-9][0-9]*\).*/\1/p')"
+	dns_over_https_capture="$(printf '%s' "$telemetry" | sed -n 's/.*"dnsOverHttpsCaptureCount":\([0-9][0-9]*\).*/\1/p')"
+	probe_bypass="$(printf '%s' "$telemetry" | sed -n 's/.*"resolverProbeBypassCount":\([0-9][0-9]*\).*/\1/p')"
+	resolver_monitor_mode="$(printf '%s' "$telemetry" | sed -n 's/.*"resolverMonitorMode":"\([^"]*\)".*/\1/p')"
+	resolver_rediscoveries="$(printf '%s' "$telemetry" | sed -n 's/.*"resolverRediscoveries":\([0-9][0-9]*\).*/\1/p')"
+	tcp_active_samples="$(printf '%s' "$telemetry" | sed -n 's/.*"tcpActiveSamples":\([0-9][0-9]*\).*/\1/p')"
+	tcp_idle_samples="$(printf '%s' "$telemetry" | sed -n 's/.*"tcpIdleSamples":\([0-9][0-9]*\).*/\1/p')"
+	tcp_sampling_mode="$(printf '%s' "$telemetry" | sed -n 's/.*"tcpSamplingMode":"\([^"]*\)".*/\1/p')"
+	tcp_sampling_lease_active="$(printf '%s' "$telemetry" | sed -n 's/.*"tcpSamplingLeaseActive":\(true\|false\).*/\1/p')"
+	tcp_sampling_lease_expires_at="$(printf '%s' "$telemetry" | sed -n 's/.*"tcpSamplingLeaseExpiresAt":\([0-9][0-9]*\).*/\1/p')"
+	tcp_sample_generation="$(printf '%s' "$telemetry" | sed -n 's/.*"tcpSampleGeneration":\([0-9][0-9]*\).*/\1/p')"
+  fi
+  [ -n "$resolver_discovered" ] || resolver_discovered=0
+  [ -n "$dns_plain_capture" ] || dns_plain_capture=0
+  [ -n "$dns_over_tls_capture" ] || dns_over_tls_capture=0
+  [ -n "$dns_over_https_capture" ] || dns_over_https_capture=0
+  [ -n "$probe_bypass" ] || probe_bypass=0
+  [ -n "$resolver_monitor_mode" ] || resolver_monitor_mode=unavailable
+  [ -n "$resolver_rediscoveries" ] || resolver_rediscoveries=0
+  [ -n "$tcp_active_samples" ] || tcp_active_samples=0
+  [ -n "$tcp_idle_samples" ] || tcp_idle_samples=0
+  [ -n "$tcp_sampling_mode" ] || tcp_sampling_mode=on_demand
+  [ -n "$tcp_sampling_lease_active" ] || tcp_sampling_lease_active=false
+  [ -n "$tcp_sampling_lease_expires_at" ] || tcp_sampling_lease_expires_at=0
+  [ -n "$tcp_sample_generation" ] || tcp_sample_generation=0
+  if [ -n "$path_payload" ]; then
+    process_supervisor="$(printf '%s' "$path_payload" | sed -n 's/.*"supervisorMode":"\([^"]*\)".*/\1/p')"
+    route_generation="$(printf '%s' "$path_payload" | sed -n 's/.*"routeGeneration":\([0-9][0-9]*\).*/\1/p')"
+    mtu_mode="$(printf '%s' "$path_payload" | sed -n 's/.*"tcpMode":"\([^"]*\)".*/\1/p')"
+    mtu_reason="$(printf '%s' "$path_payload" | sed -n 's/.*"mtuDegradedReason":"\([^"]*\)".*/\1/p')"
+  fi
+  [ -n "$process_supervisor" ] || process_supervisor=unavailable
+  [ -n "$route_generation" ] || route_generation=0
+  [ -n "$mtu_mode" ] || mtu_mode=unavailable
+  if [ -n "$mtu_reason" ]; then mtu_reason_json="\"$(json_escape "$mtu_reason")\""; else mtu_reason_json=null; fi
+  printf '{"protocolVersion":%s,"desiredState":"%s","actualState":"%s","mode":"%s","pid":%s,"startedAt":%s,"coreVersion":"%s","ebpfAttached":%s,"hotspotProxyState":"%s","controllerReady":%s,"startupHealth":"%s","systemResolverAttached":%s,"androidDnsCacheFlush":"%s","systemResolverDiscovered":%s,"dnsPlainCaptureCount":%s,"dnsOverTlsCaptureCount":%s,"dnsOverHttpsCaptureCount":%s,"resolverProbeBypassCount":%s,"resolverMonitorMode":"%s","resolverRediscoveries":%s,"tcpActiveSamples":%s,"tcpIdleSamples":%s,"tcpSamplingMode":"%s","tcpSamplingLeaseActive":%s,"tcpSamplingLeaseExpiresAt":%s,"tcpSampleGeneration":%s,"daemonState":"%s","loaderMode":"%s","attachMode":"%s","eventMode":"%s","pinGeneration":%s,"processSupervisorMode":"%s","routeGeneration":%s,"mtuMode":"%s","mtuDegradedReason":%s,"lastError":%s}\n' \
+    "$PROTOCOL" "$desired" "$actual" "$mode" "$pid_json" "$started" "$(json_escape "$core_version")" "$attached" \
+    "$hotspot_state" "$controller_ready" "$startup_health" "$system_resolver_attached" "$dns_cache_flush" "$resolver_discovered" \
+    "$dns_plain_capture" "$dns_over_tls_capture" "$dns_over_https_capture" "$probe_bypass" \
+    "$resolver_monitor_mode" "$resolver_rediscoveries" "$tcp_active_samples" "$tcp_idle_samples" \
+    "$tcp_sampling_mode" "$tcp_sampling_lease_active" "$tcp_sampling_lease_expires_at" "$tcp_sample_generation" \
+    "$daemon_state" "$loader_mode" "$attach_mode" "$event_mode" "$generation" \
+    "$process_supervisor" "$route_generation" "$mtu_mode" "$mtu_reason_json" "$error_json"
+}
+
+atomic_copy() {
+  source=$1
+  destination=$2
+  temporary="$destination.tmp.$$"
+  rm -f "$temporary"
+  cp "$source" "$temporary" || {
+    rm -f "$temporary"
+    return 1
+  }
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$destination" || {
+    rm -f "$temporary"
+    return 1
+  }
+}
+
+apply_config() {
+  source=$1
+  trace_id=${2:-}
+  prefer_live_uid_policy=${3:-false}
+  uid_policy_reset_targets=${4:-}
+  valid_trace_id "$trace_id" && set_trace_context "$trace_id"
+  [ -f "$source" ] || {
+    printf '%s\n' 'Staged config does not exist' >&2
+    clear_trace_context
+    return 2
+  }
+  candidate="$CONFIG_DIR/candidate.$$"
+  cp "$source" "$candidate" || {
+    clear_trace_context
+    return 2
+  }
+  chmod 0600 "$candidate"
+  if contains_removed_android_system_resolver_option "$candidate"; then
+    legacy_config_error >&2
+    rm -f "$candidate"
+    clear_trace_context
+    return 2
+  fi
+  trace_begin AKL/config_check "$trace_id"
+  "$CORE" check -c "$candidate" > "$RUNTIME/check.log" 2>&1 || {
+    trace_end "$trace_id"
+    cat "$RUNTIME/check.log" >&2
+    rm -f "$candidate"
+    clear_trace_context
+    return 2
+  }
+  trace_end "$trace_id"
+  if grep -q '"type"[[:space:]]*:[[:space:]]*"ebpf"' "$candidate"; then :; else
+    printf '%s\n' 'Configuration must contain an eBPF inbound' >&2
+    rm -f "$candidate"
+    clear_trace_context
+    return 2
+  fi
+  if grep -Eq '"type"[[:space:]]*:[[:space:]]*"(tun|tproxy)"' "$candidate"; then
+    printf '%s\n' 'TUN and TProxy inbounds are forbidden' >&2
+    rm -f "$candidate"
+    clear_trace_context
+    return 2
+  fi
+  if ! grep -q '"external_controller"[[:space:]]*:[[:space:]]*"127\.0\.0\.1:9090"' "$candidate"; then
+    printf '%s\n' 'Main controller must listen on 127.0.0.1:9090' >&2
+    rm -f "$candidate"
+    clear_trace_context
+    return 2
+  fi
+  was_running=false
+  if [ "$(cat "$RUNTIME/desired" 2>/dev/null)" = running ] ||
+    core_alive "$(core_pid)" || supervisor_alive "$(supervisor_pid)"; then
+    was_running=true
+  fi
+  previous_mode="$(cat "$RUNTIME/mode" 2>/dev/null || printf rule)"
+  if [ -f "$CONFIG_DIR/current.json" ] &&
+    ! atomic_copy "$CONFIG_DIR/current.json" "$CONFIG_DIR/previous.json"; then
+    rm -f "$candidate"
+    clear_trace_context
+    printf '%s\n' 'Unable to save the previous configuration' >&2
+    return 2
+  fi
+  if $was_running && [ "$prefer_live_uid_policy" = true ] &&
+    ! same_config_except_ebpf_exclusions "$CONFIG_DIR/current.json" "$candidate"; then
+    printf '%s\n' 'Exclusion update rejected because another configuration field changed' >&2
+    rm -f "$candidate"
+    clear_trace_context
+    return 2
+  fi
+  if $was_running && [ "$prefer_live_uid_policy" = true ]; then
+    [ -f "$uid_policy_reset_targets" ] || {
+      printf '%s\n' 'Missing affected application reset targets' >&2
+      rm -f "$candidate"
+      clear_trace_context
+      return 2
+    }
+    if UID_POLICY_CONNECTION_RESET="$("$CORE" akihalink-daemon \
+      --uid-policy-socket "$UID_POLICY_SOCKET" apply-uid-policy "$candidate" \
+      "$uid_policy_reset_targets" 2>> "$OBSERVABILITY_LOG")"; then
+      trace_begin AKL/config_commit "$trace_id"
+      mv -f "$candidate" "$CONFIG_DIR/current.json"
+      chmod 0600 "$CONFIG_DIR/current.json" "$CONFIG_DIR/previous.json" 2>/dev/null
+      if grep -q 'geoip-cn' "$CONFIG_DIR/current.json"; then printf '%s\n' rule > "$RUNTIME/mode"; else printf '%s\n' global > "$RUNTIME/mode"; fi
+      trace_end "$trace_id"
+      clear_trace_context
+      return 0
+    else
+      printf '%s\n' 'Live eBPF UID policy update or application reset failed' >&2
+      rm -f "$candidate"
+      clear_trace_context
+      return 4
+    fi
+  fi
+  if $was_running; then
+    printf '%s\n' stopped > "$RUNTIME/desired"
+    stop_processes
+  else
+    # A stopped selector must honor the newly generated default, not a previous live selection.
+    rm -f "$DATA/cache.db"
+  fi
+  trace_begin AKL/config_commit "$trace_id"
+  mv -f "$candidate" "$CONFIG_DIR/current.json"
+  chmod 0600 "$CONFIG_DIR/current.json" "$CONFIG_DIR/previous.json" 2>/dev/null
+  if grep -q 'geoip-cn' "$CONFIG_DIR/current.json"; then printf '%s\n' rule > "$RUNTIME/mode"; else printf '%s\n' global > "$RUNTIME/mode"; fi
+  trace_end "$trace_id"
+  if $was_running; then
+    if ! start_core "$trace_id"; then
+      printf '%s\n' stopped > "$RUNTIME/desired"
+      stop_processes
+      if [ -f "$CONFIG_DIR/previous.json" ]; then
+        atomic_copy "$CONFIG_DIR/previous.json" "$CONFIG_DIR/current.json" ||
+          printf '%s\n' 'Previous configuration could not be restored atomically' >&2
+        printf '%s\n' "$previous_mode" > "$RUNTIME/mode"
+        if ! start_core "$trace_id" >/dev/null 2>&1; then
+          printf '%s\n' stopped > "$RUNTIME/desired"
+          stop_processes
+        fi
+      fi
+      printf '%s\n' 'New configuration failed to start; previous configuration restored' >&2
+      clear_trace_context
+      return 3
+    fi
+  fi
+  clear_trace_context
+}
+
+command=${1:-}
+case "$command" in
+  activate|apply|apply-exclusions|start|stop|restart|probe|probe-hotspot|speedtest-start|speedtest-stop|\
+  telemetry-clear|observability-sampling|observability-target|observability-cleanup|\
+  cleanup|cleanup-routes|cleanup-stale|boot)
+    acquire_control_lock || exit 1
+    recover_interrupted_activation || exit 1
+    ;;
+esac
+case "$command" in
+  version)
+    features='["core","speedtest","ebpf_core_relocation","upstream_cgroup_ebpf","dns_startup_health","android_dns_cache_flush","flow_telemetry","rtnetlink_observer","passive_path_observation","pidfd_supervision","perfetto_trace_markers","live_uid_policy_status","uid_policy_connection_reset","atomic_config_activation","authenticated_startup_gate","udp_oob_batch","minimal_core_registry","on_demand_tcp_info","wifi_hotspot_proxy","cilium_ebpf_backend","ebpf_kernel_probe"]'
+    actual_core_patch_set="$(detected_core_patch_set)"
+    printf '{"moduleVersion":"%s","protocolVersion":%s,"coreCommit":"%s","corePatchSet":"%s","edition":"generic","featureSet":%s}\n' \
+      "$MODULE_VERSION" "$PROTOCOL" "$CORE_COMMIT" "$actual_core_patch_set" "$features"
+    ;;
+  status)
+    status_json
+    ;;
+  status-fast)
+    status_json true
+    ;;
+  status-health)
+    status_json true false true
+    ;;
+  uid-policy-status)
+    uid_policy_status_json
+    ;;
+  probe)
+    active_core_pid="$(core_pid)"
+    active_supervisor_pid="$(supervisor_pid)"
+    if core_ready "$active_core_pid"; then
+      ok=true; verifier=null
+    elif core_alive_fast "$active_core_pid" || supervisor_alive_fast "$active_supervisor_pid"; then
+      ok=false
+      startup_error="$(tail -c 2048 "$RUNTIME/last_error" 2>/dev/null)"
+      [ -n "$startup_error" ] || startup_error='Existing proxy core has not completed critical readiness checks'
+      verifier="\"$(json_escape "$startup_error")\""
+    else
+      cleanup_owned_redirect >> "$OBSERVABILITY_LOG" 2>&1 || true
+      cleanup_routes
+      probe_config="$RUNTIME/probe.$$.json"
+      probe_log="$RUNTIME/probe.$$.log"
+      probe_status="$RUNTIME/probe-status.$$.json"
+      preflight_ok=false
+      if "$CORE" tools ebpf status --mode local --network tcp,udp --json \
+        > "$probe_status" 2> "$probe_log"; then
+        preflight_ok=true
+      fi
+      write_probe_config "$probe_config"
+      : > "$probe_log"
+      "$CORE" run -c "$probe_config" > "$probe_log" 2>&1 &
+      probe_pid=$!
+      runtime_ok=false
+      count=0
+      while [ "$count" -lt 8 ]; do
+        if ebpf_probe_ready "$probe_log"; then runtime_ok=true; break; fi
+        raw_alive "$probe_pid" || break
+        sleep 1
+        count=$((count + 1))
+      done
+      terminate_probe "$probe_pid"
+      cleanup_routes
+      if $preflight_ok && $runtime_ok; then ok=true; else ok=false; fi
+      if $ok; then verifier=null; else verifier="\"$(json_escape "$(tail -c 4096 "$probe_log")")\""; fi
+      rm -f "$probe_config" "$probe_log" "$probe_status"
+    fi
+    if grep -q ' - cgroup2 ' /proc/self/mountinfo; then cgroup=true; else cgroup=false; fi
+    observability_probe="$(observability_probe_json)"
+    [ -n "$observability_probe" ] || observability_probe='{}'
+    set_observability_capabilities "$observability_probe"
+    printf '{"ok":%s,"kernel":"%s","cgroup2":%s,"verifierError":%s,"observability":%s,"kernelCapabilities":' \
+      "$ok" "$(json_escape "$(uname -r)")" "$cgroup" "$verifier" "$observability_probe"
+    AKIHALINK_CGROUP_BPF_PROBED=$ok kernel_capabilities_json
+    printf '}\n'
+    $ok
+    ;;
+  probe-hotspot)
+    signature="$(hotspot_probe_signature)"
+    cached_signature="$(sed -n '1p' "$HOTSPOT_PROBE_CACHE" 2>/dev/null)"
+    cached_result="$(sed -n '2p' "$HOTSPOT_PROBE_CACHE" 2>/dev/null)"
+    if [ -n "$signature" ] && [ "$cached_signature" = "$signature" ]; then
+      case "$cached_result" in
+        true) printf '%s\n' '{"supported":true}'; exit 0 ;;
+        false) printf '%s\n' '{"supported":false,"error":"cached capability probe failure"}'; exit 1 ;;
+      esac
+    fi
+    if core_alive_fast "$(core_pid)" || supervisor_alive_fast "$(supervisor_pid)"; then
+      printf '%s\n' '{"supported":false,"error":"proxy core is running"}'
+      exit 1
+    fi
+    cleanup_owned_shared_network >> "$OBSERVABILITY_LOG" 2>&1 || true
+    cleanup_routes
+    probe_config="$RUNTIME/hotspot-probe.$$.json"
+    probe_log="$RUNTIME/hotspot-probe.$$.log"
+    probe_status="$RUNTIME/hotspot-probe-status.$$.json"
+    probe_interface="aklp$$"
+    [ ! -e "/sys/class/net/$probe_interface" ] || {
+      printf '%s\n' '{"supported":false,"error":"unable to reserve a nonexistent probe interface"}'
+      exit 1
+    }
+    write_hotspot_probe_config "$probe_config" "$probe_interface"
+    preflight_supported=false
+    # An absent hotspot is a waiting state, so probe shared capabilities without
+    # turning the deliberately nonexistent interface into a required failure.
+    if "$CORE" tools ebpf status --mode shared-network --network tcp,udp \
+      --json > "$probe_status" 2> "$probe_log"; then
+      preflight_supported=true
+    fi
+    : > "$probe_log"
+    AKIHALINK_RUNTIME="$RUNTIME" "$CORE" run -c "$probe_config" > "$probe_log" 2>&1 &
+    probe_pid=$!
+    probe_starttime="$(awk '{print $22}' "/proc/$probe_pid/stat" 2>/dev/null)"
+    supported=false
+    count=0
+    while [ "$count" -lt 8 ]; do
+      if hotspot_probe_ready "$probe_log" && $preflight_supported; then supported=true; break; fi
+      raw_alive "$probe_pid" || break
+      sleep 1
+      count=$((count + 1))
+    done
+    "$CORE" akihalink-daemon process signal "$probe_pid" "$CORE" \
+      "$probe_starttime" 15 >/dev/null 2>&1 || true
+    count=0
+    while raw_alive "$probe_pid" && [ "$count" -lt 10 ]; do
+      sleep 0.1
+      count=$((count + 1))
+    done
+    if raw_alive "$probe_pid"; then
+      "$CORE" akihalink-daemon process signal "$probe_pid" "$CORE" \
+        "$probe_starttime" 9 >/dev/null 2>&1 || true
+    fi
+    cleanup_owned_shared_network >> "$OBSERVABILITY_LOG" 2>&1 || true
+    cleanup_routes
+    printf '%s\n%s\n' "$signature" "$supported" > "$HOTSPOT_PROBE_CACHE"
+    chmod 0600 "$HOTSPOT_PROBE_CACHE"
+    if $supported; then
+      printf '%s\n' '{"supported":true}'
+      result=0
+    else
+      error_text="$(tail -c 2048 "$probe_log")"
+      printf '{"supported":false,"error":"%s"}\n' "$(json_escape "$error_text")"
+      result=1
+    fi
+    rm -f "$probe_config" "$probe_log" "$probe_status" "$HOTSPOT_STATE"
+    exit "$result"
+    ;;
+  apply)
+    [ -n "${2:-}" ] || { printf '%s\n' 'Usage: akihalinkctl apply <staged-config> [trace-id]' >&2; exit 2; }
+    apply_config "$2" "${3:-}"
+    ;;
+  activate)
+    [ -n "${2:-}" ] || {
+      printf '%s\n' 'Usage: akihalinkctl activate <staged-config> [trace-id]' >&2
+      exit 2
+    }
+    activate_config "$2" "${3:-}"
+    ;;
+  apply-exclusions)
+    [ -n "${2:-}" ] && [ -n "${3:-}" ] || {
+      printf '%s\n' 'Usage: akihalinkctl apply-exclusions <staged-config> <affected-applications>' >&2
+      exit 2
+    }
+    UID_POLICY_CONNECTION_RESET=
+    apply_config "$2" '' true "$3" || exit $?
+    uid_policy_apply_result_json
+    ;;
+  start)
+    start_core "${2:-}" || { stop_failed_start; status_json true false true; exit 1; }
+    status_json true false true
+    ;;
+  stop)
+    stop_core
+    case "${2:-}" in
+      global|rule|direct) printf '%s\n' "$2" > "$RUNTIME/mode" ;;
+    esac
+    status_json true
+    ;;
+  restart)
+    trace_id=${2:-}
+    stop_core
+    valid_trace_id "$trace_id" && set_trace_context "$trace_id"
+    printf '%s\n' running > "$RUNTIME/desired"
+    start_core "$trace_id" || { stop_failed_start; status_json true false true; exit 1; }
+    status_json true false true
+    ;;
+  speedtest-start)
+    [ -n "${2:-}" ] || { printf '%s\n' 'Usage: akihalinkctl speedtest-start <staged-config>' >&2; exit 2; }
+    start_speedtest "$2" || { speedtest_status_json failed; exit 1; }
+    speedtest_status_json
+    ;;
+  speedtest-status)
+    speedtest_status_json
+    ;;
+  speedtest-stop)
+    if ! stop_speedtest; then
+      speedtest_status_json
+      exit 1
+    fi
+    speedtest_status_json
+    ;;
+  telemetry-status)
+    if ! observability_client status 2>/dev/null; then
+      printf '{"running":false,"windowSeconds":900,"loaderMode":"unavailable","attachMode":"none","eventMode":"none","pinGeneration":0,"activeFlows":0,"totalFlows":0,"rttMedianMs":0,"rttP95Ms":0,"handshakeMedianMs":0,"handshakeP95Ms":0,"deliveryRateBps":0,"estimatedLossRate":0,"totalRetrans":0,"failures":{},"ringBufferDropped":0,"recentFlows":[]}\n'
+    fi
+    ;;
+  telemetry-clear)
+    if observability_alive "$(observability_pid)"; then
+      observability_client clear
+    else
+      sh "$0" telemetry-status
+    fi
+    ;;
+  network-events)
+    limit=${2:-100}
+    case "$limit" in ''|*[!0-9]*) printf '%s\n' 'Invalid network event limit' >&2; exit 2 ;; esac
+    [ "$limit" -ge 1 ] && [ "$limit" -le 200 ] || {
+      printf '%s\n' 'Invalid network event limit' >&2
+      exit 2
+    }
+    if observability_alive "$(observability_pid)"; then
+      observability_client network-events "$limit"
+    else
+      printf '[]\n'
+    fi
+    ;;
+  observability-snapshot)
+    limit=${2:-100}
+    case "$limit" in ''|*[!0-9]*) printf '%s\n' 'Invalid observability snapshot limit' >&2; exit 2 ;; esac
+    [ "$limit" -ge 0 ] && [ "$limit" -le 200 ] || {
+      printf '%s\n' 'Invalid observability snapshot limit' >&2
+      exit 2
+    }
+    if observability_alive "$(observability_pid)"; then
+      observability_client snapshot "$limit"
+    else
+      printf '{"pathStatus":{"routeGeneration":0,"tcpMtuProbing":-1,"tcpMode":"unavailable","perSocketPmtu":false,"perSocketMss":false,"quicDplpmtud":true,"degradedReason":"daemon_unavailable","paths":[],"supervisor":{"mode":"unavailable","pidfdOpen":false,"pidfdSendSignal":false,"pidfdPoll":false}},"networkEvents":[]}\n'
+    fi
+    ;;
+  observability-sampling)
+    sampling_action=${2:-}
+    case "$sampling_action" in
+      acquire)
+        if observability_alive "$(observability_pid)"; then
+          observability_client sampling-acquire 2000
+        else
+          printf '{"running":false,"tcpSamplingMode":"on_demand","tcpSamplingLeaseActive":false,"tcpSamplingLeaseExpiresAt":0,"tcpSampleGeneration":0}\n'
+        fi
+        ;;
+      renew|release)
+        if observability_alive "$(observability_pid)"; then
+          observability_client "sampling-$sampling_action"
+        else
+          printf '{"running":false,"tcpSamplingMode":"on_demand","tcpSamplingLeaseActive":false,"tcpSamplingLeaseExpiresAt":0,"tcpSampleGeneration":0}\n'
+        fi
+        ;;
+      *)
+        printf '%s\n' 'Usage: akihalinkctl observability-sampling acquire|renew|release' >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  path-status)
+    if ! observability_client path-status 2>/dev/null; then
+      printf '{"routeGeneration":0,"tcpMtuProbing":-1,"tcpMode":"unavailable","perSocketPmtu":false,"perSocketMss":false,"quicDplpmtud":true,"degradedReason":"daemon_unavailable","paths":[],"supervisor":{"mode":"unavailable","pidfdOpen":false,"pidfdSendSignal":false,"pidfdPoll":false}}\n'
+    fi
+    ;;
+  observability-ready)
+    [ -n "${2:-}" ] || exit 2
+    observability_client ready "$2" >/dev/null
+    ;;
+  observability-target)
+    [ -n "${2:-}" ] && [ -n "${3:-}" ] || exit 2
+    printf '%s' "$2" | grep -Eq '^[A-Za-z0-9_-]{1,128}$' || exit 2
+    printf '%s' "$3" | grep -Eq '^[0-9a-f]{64}$' || exit 2
+    observability_client target "$2" "$3" >/dev/null
+    ;;
+  observability-cleanup)
+    stop_observability true
+    cleanup_owned_redirect >> "$OBSERVABILITY_LOG" 2>&1 || true
+    cleanup_routes
+    ;;
+  diagnostics)
+    printf '{"version":'
+    sh "$0" version | tr -d '\n'
+    printf ',"status":'
+    status_json true true | tr -d '\n'
+    printf ',"kernel":"%s","mountinfo":"%s","kernelCapabilities":' \
+      "$(json_escape "$(uname -a)")" \
+      "$(json_escape "$(grep ' - cgroup2 ' /proc/self/mountinfo | head -n 1)")"
+    if core_ready_from_marker "$(core_pid)"; then
+      set_observability_capabilities "$(observability_probe_json)"
+      AKIHALINK_CGROUP_BPF_PROBED=true kernel_capabilities_json
+    else
+      set_observability_capabilities "$(observability_probe_json)"
+      kernel_capabilities_json
+    fi
+    if speedtest_alive "$(speedtest_pid)"; then speedtest_running=true; else speedtest_running=false; fi
+    printf ',"speedTest":{"running":%s}' "$speedtest_running"
+    printf ',"telemetry":{"detail":"aggregate_only"}'
+    printf ',"networkEvents":[]'
+    printf ',"pathStatus":{"detail":"aggregate_only"}'
+    if [ -r "$LOGDIR/core.log" ]; then
+      log_summary="$(tail -n 2000 "$LOGDIR/core.log" 2>/dev/null | awk '
+        BEGIN { lines = 0; dns = 0; outbound = 0 }
+        {
+          lines++
+          text = tolower($0)
+          if (text ~ /dns:/ && text ~ /(fail|error|timeout)/) dns++
+          if (text ~ /outbound/ && text ~ /(fail|error|timeout)/) outbound++
+        }
+        END { printf "%d %d %d", lines, dns, outbound }
+      ')"
+      set -- $log_summary
+      log_lines=${1:-0}
+      dns_errors=${2:-0}
+      outbound_errors=${3:-0}
+    else
+      log_lines=0
+      dns_errors=0
+      outbound_errors=0
+    fi
+    case "$log_lines" in ''|*[!0-9]*) log_lines=0 ;; esac
+    case "$dns_errors" in ''|*[!0-9]*) dns_errors=0 ;; esac
+    case "$outbound_errors" in ''|*[!0-9]*) outbound_errors=0 ;; esac
+    printf ',"logSummary":{"lineCount":%s,"dnsErrors":%s,"outboundErrors":%s}}\n' \
+      "$log_lines" "$dns_errors" "$outbound_errors"
+    ;;
+  cleanup)
+    stop_speedtest
+    clear_trace_context
+    printf '%s\n' stopped > "$RUNTIME/desired"
+    stop_processes
+    printf '%s\n' stopped > "$RUNTIME/actual"
+    status_json
+    ;;
+  cleanup-routes)
+    cleanup_routes
+    ;;
+  cleanup-stale)
+    cleanup_routes
+    detach_stale
+    cleanup_owned_shared_network >> "$OBSERVABILITY_LOG" 2>&1 || true
+    ;;
+  boot)
+    stop_speedtest
+    if [ "$(cat "$RUNTIME/desired" 2>/dev/null)" = running ]; then
+      if ! start_core; then
+        stop_failed_start
+      fi
+    else
+      rm -f "$RUNTIME/core.pid" "$RUNTIME/supervisor.pid" "$RUNTIME/started_at"
+      printf '%s\n' stopped > "$RUNTIME/actual"
+      cleanup_owned_redirect >> "$OBSERVABILITY_LOG" 2>&1 || true
+      cleanup_owned_shared_network >> "$OBSERVABILITY_LOG" 2>&1 || true
+      cleanup_routes
+    fi
+    ;;
+  *)
+    printf '%s\n' 'Usage: akihalinkctl {version|status|status-fast|status-health|probe|probe-hotspot|activate <file>|apply <file>|start|stop|restart|speedtest-start <file>|speedtest-status|speedtest-stop|telemetry-status|telemetry-clear|network-events [limit]|observability-snapshot [limit]|observability-sampling acquire|renew|release|path-status|diagnostics|uid-policy-status|apply-exclusions <config> <applications>|cleanup}' >&2
+    exit 2
+    ;;
+esac

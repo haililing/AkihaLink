@@ -1,0 +1,2342 @@
+diff --git a/adapter/handler.go b/adapter/handler.go
+index 4f54d186..6ec62569 100644
+--- a/adapter/handler.go
++++ b/adapter/handler.go
+@@ -25,6 +25,10 @@ type OOBPacketHandler interface {
+ 	NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr)
+ }
+ 
++type OOBPacketBatchHandler interface {
++	NewPacketBatch(buffers []*buf.Buffer, oobs [][]byte, sources []M.Socksaddr)
++}
++
+ type PacketConnectionHandler interface {
+ 	NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata InboundContext, onClose N.CloseHandlerFunc)
+ }
+diff --git a/common/ebpf/android_system_resolver.go b/common/ebpf/android_system_resolver.go
+new file mode 100644
+index 00000000..ca91093d
+--- /dev/null
++++ b/common/ebpf/android_system_resolver.go
+@@ -0,0 +1,291 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strconv"
++	"strings"
++	"time"
++	"unsafe"
++
++	E "github.com/sagernet/sing/common/exceptions"
++
++	CiliumEBPF "github.com/cilium/ebpf"
++	"golang.org/x/sys/unix"
++)
++
++const (
++	androidSystemResolverRefreshInterval = 2 * time.Second
++	maxAndroidSystemResolverTGIDs        = 16
++)
++
++type AndroidSystemResolverStatus struct {
++	Required     bool
++	Discovered   int
++	PlainDNS     uint64
++	DNSOverTLS   uint64
++	DNSOverHTTPS uint64
++}
++
++func androidSystemResolverRequired() bool {
++	return runtime.GOOS == "android" && os.Getenv("AKIHALINK_RUNTIME") != ""
++}
++
++func discoverAndroidSystemResolverTGIDs(enabled bool) (map[uint32]struct{}, error) {
++	result := make(map[uint32]struct{})
++	if !enabled {
++		return result, nil
++	}
++	entries, err := os.ReadDir("/proc")
++	if err != nil {
++		return nil, err
++	}
++	for _, entry := range entries {
++		pid, parseErr := strconv.ParseUint(entry.Name(), 10, 32)
++		if parseErr != nil || !isAndroidSystemResolverProcess("/proc", entry.Name()) {
++			continue
++		}
++		result[uint32(pid)] = struct{}{}
++		if len(result) > maxAndroidSystemResolverTGIDs {
++			return nil, fmt.Errorf("too many verified Android netd processes")
++		}
++	}
++	return result, nil
++}
++
++func isAndroidSystemResolverProcess(procRoot, processName string) bool {
++	processRoot := filepath.Join(procRoot, processName)
++	comm, err := os.ReadFile(filepath.Join(processRoot, "comm"))
++	if err != nil || !isAndroidSystemResolverThreadName(strings.TrimSpace(string(comm)), processName) {
++		return false
++	}
++	status, err := os.ReadFile(filepath.Join(processRoot, "status"))
++	if err != nil || !hasRootUID(status) {
++		return false
++	}
++	commandLine, err := os.ReadFile(filepath.Join(processRoot, "cmdline"))
++	if err != nil {
++		return false
++	}
++	command := strings.SplitN(string(commandLine), "\x00", 2)[0]
++	executable, executableErr := os.Readlink(filepath.Join(processRoot, "exe"))
++	return isAndroidSystemResolverExecutable(command, executable, executableErr)
++}
++
++func isAndroidSystemResolverExecutable(command, executable string, executableErr error) bool {
++	if filepath.Base(command) != "netd" {
++		return false
++	}
++	if executableErr == nil {
++		return filepath.Base(strings.TrimSuffix(executable, " (deleted)")) == "netd"
++	}
++	return isPermissionError(executableErr) && isTrustedAndroidSystemResolverCommand(command)
++}
++
++func isPermissionError(err error) bool {
++	return errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)
++}
++func isTrustedAndroidSystemResolverCommand(command string) bool {
++	command = filepath.Clean(command)
++	switch command {
++	case "/system/bin/netd", "/system_ext/bin/netd", "/product/bin/netd", "/vendor/bin/netd", "/odm/bin/netd":
++		return true
++	default:
++		return strings.HasPrefix(command, "/apex/") && strings.HasSuffix(command, "/bin/netd")
++	}
++}
++
++func isAndroidSystemResolverThreadName(threadName, processName string) bool {
++	threadName = strings.ToLower(threadName)
++	if threadName == "netd" || threadName == "binder:netd" {
++		return true
++	}
++	threadIndex, found := strings.CutPrefix(threadName, "binder:"+processName+"_")
++	if !found || threadIndex == "" {
++		return false
++	}
++	_, err := strconv.ParseUint(threadIndex, 10, 32)
++	return err == nil
++}
++
++func hasRootUID(status []byte) bool {
++	for _, line := range strings.Split(string(status), "\n") {
++		fields := strings.Fields(line)
++		if len(fields) >= 2 && fields[0] == "Uid:" {
++			return fields[1] == "0"
++		}
++	}
++	return false
++}
++
++func (b *CgroupBackend) replaceAndroidSystemResolverTGIDs(next map[uint32]struct{}) error {
++	if b == nil {
++		return errBackendClosed
++	}
++	b.access.Lock()
++	defer b.access.Unlock()
++	if err := b.health.requireUsable(b.runtime != nil); err != nil {
++		return err
++	}
++	mapInstance := b.runtime.maps["cgroup_system_resolver_tgid"]
++	if mapInstance == nil {
++		if len(next) == 0 {
++			return nil
++		}
++		return E.New("Android system resolver map is unavailable")
++	}
++	additions := make([]uint32, 0, len(next))
++	for tgid := range next {
++		if _, loaded := b.systemResolverTGIDs[tgid]; !loaded {
++			additions = append(additions, tgid)
++		}
++	}
++	removals := make([]uint32, 0, len(b.systemResolverTGIDs))
++	for tgid := range b.systemResolverTGIDs {
++		if _, loaded := next[tgid]; !loaded {
++			removals = append(removals, tgid)
++		}
++	}
++	added, removed, updateErr := replaceUint32SetMap(mapInstance, additions, removals)
++	if updateErr != nil {
++		rollbackErr := rollbackUint32SetMap(mapInstance, added, removed)
++		err := policyUpdateError(updateErr, rollbackErr)
++		if policyRollbackFailed(err) {
++			return E.Errors(err, b.health.invalidate("cgroup", "Android system resolver TGID"))
++		}
++		return err
++	}
++	b.systemResolverTGIDs = cloneUint32Set(next)
++	return nil
++}
++
++func replaceUint32SetMap(mapInstance *CiliumEBPF.Map, additions, removals []uint32) ([]uint32, []uint32, error) {
++	if mapInstance == nil {
++		return nil, nil, errBackendClosed
++	}
++	value := uint8(1)
++	added := make([]uint32, 0, len(additions))
++	for _, key := range additions {
++		if err := updateMapWithFlags(mapInstance.FD(), unsafe.Pointer(&key), unsafe.Pointer(&value), bpfNoExist); err != nil {
++			if errors.Is(err, unix.EEXIST) || errors.Is(err, CiliumEBPF.ErrKeyExist) {
++				continue
++			}
++			return added, nil, err
++		}
++		added = append(added, key)
++	}
++	removed := make([]uint32, 0, len(removals))
++	for _, key := range removals {
++		if err := deleteMap(mapInstance.FD(), unsafe.Pointer(&key)); err != nil {
++			if errors.Is(err, unix.ENOENT) || errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
++				continue
++			}
++			return added, removed, err
++		}
++		removed = append(removed, key)
++	}
++	return added, removed, nil
++}
++
++func rollbackUint32SetMap(mapInstance *CiliumEBPF.Map, added, removed []uint32) error {
++	if mapInstance == nil {
++		return errBackendClosed
++	}
++	value := uint8(1)
++	var rollbackErr error
++	for _, key := range removed {
++		if err := updateMap(mapInstance.FD(), unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	for _, key := range added {
++		if err := deleteMap(mapInstance.FD(), unsafe.Pointer(&key)); err != nil &&
++			!errors.Is(err, unix.ENOENT) && !errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	return rollbackErr
++}
++
++func cloneUint32Set(source map[uint32]struct{}) map[uint32]struct{} {
++	cloned := make(map[uint32]struct{}, len(source))
++	for value := range source {
++		cloned[value] = struct{}{}
++	}
++	return cloned
++}
++
++func (b *CgroupBackend) startAndroidSystemResolverMonitor() {
++	if b == nil || !androidSystemResolverRequired() || b.systemResolverTGIDMapFD < 0 {
++		return
++	}
++	b.systemResolverMonitorAccess.Lock()
++	defer b.systemResolverMonitorAccess.Unlock()
++	if b.systemResolverMonitorStop != nil {
++		return
++	}
++	stop := make(chan struct{})
++	done := make(chan struct{})
++	b.systemResolverMonitorStop = stop
++	b.systemResolverMonitorDone = done
++	go func() {
++		defer close(done)
++		ticker := time.NewTicker(androidSystemResolverRefreshInterval)
++		defer ticker.Stop()
++		for {
++			select {
++			case <-stop:
++				return
++			case <-ticker.C:
++				next, err := discoverAndroidSystemResolverTGIDs(true)
++				if err == nil {
++					_ = b.replaceAndroidSystemResolverTGIDs(next)
++				}
++			}
++		}
++	}()
++}
++
++func (b *CgroupBackend) stopAndroidSystemResolverMonitor() {
++	if b == nil {
++		return
++	}
++	b.systemResolverMonitorAccess.Lock()
++	defer b.systemResolverMonitorAccess.Unlock()
++	if b.systemResolverMonitorStop == nil {
++		return
++	}
++	close(b.systemResolverMonitorStop)
++	<-b.systemResolverMonitorDone
++	b.systemResolverMonitorStop = nil
++	b.systemResolverMonitorDone = nil
++}
++
++func (b *CgroupBackend) AndroidSystemResolverStatus() (AndroidSystemResolverStatus, error) {
++	if b == nil {
++		return AndroidSystemResolverStatus{}, errBackendClosed
++	}
++	b.access.RLock()
++	defer b.access.RUnlock()
++	if err := b.health.requireUsable(b.runtime != nil); err != nil {
++		return AndroidSystemResolverStatus{}, err
++	}
++	status := AndroidSystemResolverStatus{
++		Required:   b.runtime.system_resolver,
++		Discovered: len(b.systemResolverTGIDs),
++	}
++	var err error
++	status.PlainDNS, err = b.readCgroupStatLocked(cgroupStatResolverDNS)
++	if err == nil {
++		status.DNSOverTLS, err = b.readCgroupStatLocked(cgroupStatResolverTLS)
++	}
++	if err == nil {
++		status.DNSOverHTTPS, err = b.readCgroupStatLocked(cgroupStatResolverHTTPS)
++	}
++	return status, err
++}
+diff --git a/common/ebpf/android_system_resolver_test.go b/common/ebpf/android_system_resolver_test.go
+new file mode 100644
+index 00000000..c0892a6b
+--- /dev/null
++++ b/common/ebpf/android_system_resolver_test.go
+@@ -0,0 +1,79 @@
++//go:build with_ebpf && linux
++
++package ebpf
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestAndroidSystemResolverIdentity(t *testing.T) {
++	procRoot := t.TempDir()
++	processRoot := filepath.Join(procRoot, "123")
++	if err := os.MkdirAll(processRoot, 0o700); err != nil {
++		t.Fatal(err)
++	}
++	write := func(name string, content []byte) {
++		t.Helper()
++		if err := os.WriteFile(filepath.Join(processRoot, name), content, 0o600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	write("status", []byte("Name:\tnetd\nUid:\t0\t0\t0\t0\n"))
++	write("cmdline", []byte("/system/bin/netd\x00"))
++	if err := os.Symlink("/system/bin/netd", filepath.Join(processRoot, "exe")); err != nil {
++		t.Fatal(err)
++	}
++	for _, testCase := range []struct {
++		threadName string
++		accepted   bool
++	}{
++		{"netd", true},
++		{"Binder:netd", true},
++		{"binder:123_4", true},
++		{"Binder:123_4", true},
++		{"binder:456_4", false},
++		{"binder:123_worker", false},
++	} {
++		write("comm", []byte(testCase.threadName+"\n"))
++		if actual := isAndroidSystemResolverProcess(procRoot, "123"); actual != testCase.accepted {
++			t.Fatalf("thread name %q accepted=%t, want %t", testCase.threadName, actual, testCase.accepted)
++		}
++	}
++	write("comm", []byte("netd\n"))
++	write("status", []byte("Name:\tnetd\nUid:\t1000\t1000\t1000\t1000\n"))
++	if isAndroidSystemResolverProcess(procRoot, "123") {
++		t.Fatal("non-root netd identity was accepted")
++	}
++}
++
++func TestAndroidSystemResolverExecutableFallback(t *testing.T) {
++	for _, testCase := range []struct {
++		name          string
++		command       string
++		executable    string
++		executableErr error
++		accepted      bool
++	}{
++		{"readable system executable", "/system/bin/netd", "/system/bin/netd", nil, true},
++		{"readable bare command", "netd", "/system/bin/netd", nil, true},
++		{"readable wrong executable", "/system/bin/netd", "/data/local/tmp/netd-wrapper", nil, false},
++		{"permission denied system command", "/system/bin/netd", "", os.ErrPermission, true},
++		{"permission denied APEX command", "/apex/com.android.tethering/bin/netd", "", os.ErrPermission, true},
++		{"permission denied data command", "/data/local/tmp/netd", "", os.ErrPermission, false},
++		{"missing system executable", "/system/bin/netd", "", os.ErrNotExist, false},
++		{"wrong command", "/system/bin/not-netd", "/system/bin/netd", nil, false},
++	} {
++		t.Run(testCase.name, func(t *testing.T) {
++			actual := isAndroidSystemResolverExecutable(
++				testCase.command,
++				testCase.executable,
++				testCase.executableErr,
++			)
++			if actual != testCase.accepted {
++				t.Fatalf("accepted=%t, want %t", actual, testCase.accepted)
++			}
++		})
++	}
++}
+diff --git a/common/ebpf/cgroup_abi.go b/common/ebpf/cgroup_abi.go
+index 7bfd87d7..9cb38902 100644
+--- a/common/ebpf/cgroup_abi.go
++++ b/common/ebpf/cgroup_abi.go
+@@ -26,6 +26,11 @@ const (
+ 	MaxConfigurableMapCapacity    = 1 << 20
+ 	cgroupStatTCPRedirectFailure  = 0
+ 	cgroupStatUDPRedirectFailure
++	cgroupStatTCPUIDBypass
++	cgroupStatUDPUIDBypass
++	cgroupStatResolverDNS
++	cgroupStatResolverTLS
++	cgroupStatResolverHTTPS
+ 	originalDestinationFlagConnectedUDP = 1
+ 	udpFlowActionProxy                  = 1
+ 	udpFlowActionBypass                 = 2
+@@ -52,6 +57,7 @@ const (
+ 	cgroupFlagHostIPv6
+ 	cgroupFlagFakeIPIPv4
+ 	cgroupFlagFakeIPIPv6
++	cgroupFlagSystemResolver
+ )
+ 
+ type cgroupControl struct {
+diff --git a/common/ebpf/cgroup_attachment.go b/common/ebpf/cgroup_attachment.go
+index 2e37c5f1..70fad7ff 100644
+--- a/common/ebpf/cgroup_attachment.go
++++ b/common/ebpf/cgroup_attachment.go
+@@ -110,6 +110,7 @@ func (b *CgroupBackend) Attach() error {
+ 		_ = b.detachProgramsLocked()
+ 		return eBPFOperationError("attach eBPF inbound UDP cleanup", unix.EINVAL)
+ 	}
++	b.startAndroidSystemResolverMonitor()
+ 	return nil
+ }
+ 
+diff --git a/common/ebpf/cgroup_backend.go b/common/ebpf/cgroup_backend.go
+index 58c8c920..0a23db53 100644
+--- a/common/ebpf/cgroup_backend.go
++++ b/common/ebpf/cgroup_backend.go
+@@ -70,6 +70,7 @@ type cgroupRuntime struct {
+ 	host_ipv4_map_fd            int
+ 	host_ipv6_map_fd            int
+ 	ipv6_available_map_fd       int
++	system_resolver_tgid_map_fd int
+ 	socket_release_supported    bool
+ 	self_bypass_tgid            bool
+ 	enable_tcp                  bool
+@@ -79,6 +80,7 @@ type cgroupRuntime struct {
+ 	bypass_ipv4_policy          bool
+ 	bypass_ipv6_policy          bool
+ 	auto_ipv6                   bool
++	system_resolver             bool
+ 	socket_bypass_capacity      uint32
+ }
+ 
+@@ -116,6 +118,14 @@ type CgroupBackend struct {
+ 	hostIPv4MapFD                  int
+ 	hostIPv6MapFD                  int
+ 	ipv6AvailableMapFD             int
++	uidPolicyEntries               []uidLPMKey
++	uidPolicy                      CgroupPolicy
++	uidDefaultBypass               bool
++	systemResolverTGIDMapFD        int
++	systemResolverTGIDs            map[uint32]struct{}
++	systemResolverMonitorAccess    sync.Mutex
++	systemResolverMonitorStop      chan struct{}
++	systemResolverMonitorDone      chan struct{}
+ 	bypassIPv4CIDR                 []netip.Prefix
+ 	bypassIPv6CIDR                 []netip.Prefix
+ 	hostIPv4                       []netip.Prefix
+@@ -195,6 +205,14 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 	if err = checkLPMTriePolicyCompatibility("UID", len(uidPolicyEntries)); err != nil {
+ 		return nil, err
+ 	}
++	resolverRequired := androidSystemResolverRequired()
++	resolverTGIDs, err := discoverAndroidSystemResolverTGIDs(resolverRequired)
++	if err != nil {
++		return nil, E.Cause(err, "discover Android system resolver")
++	}
++	if resolverRequired && len(resolverTGIDs) == 0 {
++		return nil, E.New("verified root netd process was not found")
++	}
+ 	if cgroupPath == "" {
+ 		cgroupPath, err = DetectCgroup2Mount()
+ 		if err != nil {
+@@ -242,6 +260,7 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 		bypass_ipv4_policy:          policy.EnableBypassCIDR && redirectIPv4.IsValid(),
+ 		bypass_ipv6_policy:          policy.EnableBypassCIDR && redirectIPv6.IsValid(),
+ 		auto_ipv6:                   config.AutoIPv6,
++		system_resolver:             resolverRequired,
+ 		socket_release_supported:    socketReleaseSupported,
+ 		socket_bypass_capacity:      mapCapacity.SocketBypass,
+ 		bypass_socket_cookie_map_fd: -1,
+@@ -255,30 +274,35 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 		return nil, err
+ 	}
+ 	backend := &CgroupBackend{
+-		mapCapacity:          mapCapacity,
+-		runtime:              runtimeState,
+-		tcpRedirectMapFD:     runtimeState.tcp_redirect_map_fd,
+-		statsMapFD:           runtimeState.stats_map_fd,
+-		udpRedirectMapFD:     runtimeState.udp_redirect_map_fd,
+-		udpRecoveryMapFD:     runtimeState.udp_recovery_map_fd,
+-		udpFlowMapFD:         runtimeState.udp_flow_map_fd,
+-		socketBypassMapFD:    -1,
+-		bypassIPv4CIDRMapFD:  runtimeState.bypass_ipv4_cidr_map_fd,
+-		bypassIPv6CIDRMapFD:  runtimeState.bypass_ipv6_cidr_map_fd,
+-		hostIPv4MapFD:        runtimeState.host_ipv4_map_fd,
+-		hostIPv6MapFD:        runtimeState.host_ipv6_map_fd,
+-		ipv6AvailableMapFD:   runtimeState.ipv6_available_map_fd,
+-		cgroupPath:           cgroupPath,
+-		redirectIPv4:         redirectIPv4,
+-		redirectIPv6:         redirectIPv6,
+-		fakeIPIPv4:           fakeIPIPv4,
+-		fakeIPIPv6:           fakeIPIPv6,
+-		enableIPv6:           config.EnableIPv6,
+-		autoIPv6:             config.AutoIPv6,
+-		enableUDP:            config.EnableUDP,
+-		dnsMode:              policy.DNSMode,
+-		bypassPrivateAddress: policy.BypassPrivateAddress,
+-		udpTimeoutSeconds:    udpTimeoutSeconds,
++		mapCapacity:             mapCapacity,
++		runtime:                 runtimeState,
++		tcpRedirectMapFD:        runtimeState.tcp_redirect_map_fd,
++		statsMapFD:              runtimeState.stats_map_fd,
++		udpRedirectMapFD:        runtimeState.udp_redirect_map_fd,
++		udpRecoveryMapFD:        runtimeState.udp_recovery_map_fd,
++		udpFlowMapFD:            runtimeState.udp_flow_map_fd,
++		socketBypassMapFD:       -1,
++		bypassIPv4CIDRMapFD:     runtimeState.bypass_ipv4_cidr_map_fd,
++		bypassIPv6CIDRMapFD:     runtimeState.bypass_ipv6_cidr_map_fd,
++		hostIPv4MapFD:           runtimeState.host_ipv4_map_fd,
++		hostIPv6MapFD:           runtimeState.host_ipv6_map_fd,
++		ipv6AvailableMapFD:      runtimeState.ipv6_available_map_fd,
++		cgroupPath:              cgroupPath,
++		redirectIPv4:            redirectIPv4,
++		redirectIPv6:            redirectIPv6,
++		fakeIPIPv4:              fakeIPIPv4,
++		fakeIPIPv6:              fakeIPIPv6,
++		enableIPv6:              config.EnableIPv6,
++		autoIPv6:                config.AutoIPv6,
++		enableUDP:               config.EnableUDP,
++		dnsMode:                 policy.DNSMode,
++		bypassPrivateAddress:    policy.BypassPrivateAddress,
++		udpTimeoutSeconds:       udpTimeoutSeconds,
++		uidPolicyEntries:        cloneUIDPolicyEntries(uidPolicyEntries),
++		uidPolicy:               cloneCgroupPolicy(policy),
++		uidDefaultBypass:        uidDefaultBypass,
++		systemResolverTGIDMapFD: runtimeState.system_resolver_tgid_map_fd,
++		systemResolverTGIDs:     make(map[uint32]struct{}),
+ 	}
+ 	if config.AutoIPv6 {
+ 		if _, err = backend.updateIPv6AvailableLocked(config.IPv6Available); err != nil {
+@@ -290,5 +314,9 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 		_ = backend.Close()
+ 		return nil, E.Cause(err, "populate UID policy eBPF map")
+ 	}
++	if err = backend.replaceAndroidSystemResolverTGIDs(resolverTGIDs); err != nil {
++		_ = backend.Close()
++		return nil, E.Cause(err, "populate Android system resolver eBPF map")
++	}
+ 	return backend, nil
+ }
+diff --git a/common/ebpf/cgroup_lifecycle.go b/common/ebpf/cgroup_lifecycle.go
+index d51f0ea5..de0886f7 100644
+--- a/common/ebpf/cgroup_lifecycle.go
++++ b/common/ebpf/cgroup_lifecycle.go
+@@ -8,6 +8,8 @@ func (b *CgroupBackend) Close() error {
+ 	if b == nil {
+ 		return nil
+ 	}
++	b.removeReadinessMarker()
++	b.stopAndroidSystemResolverMonitor()
+ 	b.access.Lock()
+ 	defer b.access.Unlock()
+ 	if b.runtime == nil {
+@@ -33,6 +35,10 @@ func (b *CgroupBackend) Close() error {
+ 	b.hostIPv4MapFD = -1
+ 	b.hostIPv6MapFD = -1
+ 	b.ipv6AvailableMapFD = -1
++	b.uidPolicyEntries = nil
++	b.uidPolicy = CgroupPolicy{}
++	b.systemResolverTGIDMapFD = -1
++	b.systemResolverTGIDs = nil
+ 	b.bypassIPv4CIDR = nil
+ 	b.bypassIPv6CIDR = nil
+ 	b.hostIPv4 = nil
+diff --git a/common/ebpf/cgroup_maps.go b/common/ebpf/cgroup_maps.go
+index 68ce3fdc..6d9fb73d 100644
+--- a/common/ebpf/cgroup_maps.go
++++ b/common/ebpf/cgroup_maps.go
+@@ -12,7 +12,7 @@ import (
+ 	"golang.org/x/sys/unix"
+ )
+ 
+-func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, uidEntries int) error {
++func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, _ int) error {
+ 	udpLayout := cgroupUDPMapConfiguration(
+ 		runtimeState.enable_udp,
+ 		runtimeState.socket_release_supported,
+@@ -27,26 +27,24 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity,
+ 		udpCapacity = capacity.UDPRedirect
+ 	}
+ 	recoveryCapacity := min(udpCapacity, uint32(UDPRecoveryMapCapacity))
+-	uidCapacity := uint32(uidEntries)
+-	if uidCapacity == 0 {
+-		uidCapacity = 1
+-	}
++	uidCapacity := uint32(maxUIDPolicyEntries)
+ 	var err error
+ 	runtimeState.maps, err = loadObjectMaps(loadCgroup, map[string]mapSpecOverride{
+-		"cgroup_control":        {name: "sb_cg_control", mapType: CiliumEBPF.Array, maxEntries: 1},
+-		"cgroup_stats":          {name: "sb_cg_stats", mapType: CiliumEBPF.Array, maxEntries: 2},
+-		"cgroup_tcp_redirect":   {name: "sb_cg_tcp", mapType: CiliumEBPF.Hash, maxEntries: tcpCapacity, flags: bpfFlagNoPrealloc},
+-		"cgroup_udp_redirect":   {name: "sb_cg_udp", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
+-		"cgroup_udp_recovery":   {name: "sb_cg_recover", mapType: CiliumEBPF.LRUHash, maxEntries: recoveryCapacity},
+-		"cgroup_udp_token":      {name: "sb_cg_token", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
+-		"cgroup_udp_peer":       {name: "sb_cg_peer", mapType: udpLayout.peerType, maxEntries: udpLayout.peerCapacity, flags: udpLayout.peerFlags},
+-		"cgroup_udp_flow":       {name: "sb_cg_flow", mapType: CiliumEBPF.LRUHash, maxEntries: udpLayout.flowCapacity},
+-		"cgroup_uid_policy":     {name: "sb_cg_uid", mapType: CiliumEBPF.LPMTrie, maxEntries: uidCapacity, flags: bpfFlagNoPrealloc},
+-		"cgroup_bypass_ipv4":    {name: "sb_cg_bypass4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
+-		"cgroup_bypass_ipv6":    {name: "sb_cg_bypass6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
+-		"cgroup_host_ipv4":      {name: "sb_cg_host4", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
+-		"cgroup_host_ipv6":      {name: "sb_cg_host6", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
+-		"cgroup_ipv6_available": {name: "sb_cg_ipv6", mapType: CiliumEBPF.Array, maxEntries: 1},
++		"cgroup_control":              {name: "sb_cg_control", mapType: CiliumEBPF.Array, maxEntries: 1},
++		"cgroup_stats":                {name: "sb_cg_stats", mapType: CiliumEBPF.Array, maxEntries: cgroupStatResolverHTTPS + 1},
++		"cgroup_tcp_redirect":         {name: "sb_cg_tcp", mapType: CiliumEBPF.Hash, maxEntries: tcpCapacity, flags: bpfFlagNoPrealloc},
++		"cgroup_udp_redirect":         {name: "sb_cg_udp", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
++		"cgroup_udp_recovery":         {name: "sb_cg_recover", mapType: CiliumEBPF.LRUHash, maxEntries: recoveryCapacity},
++		"cgroup_udp_token":            {name: "sb_cg_token", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
++		"cgroup_udp_peer":             {name: "sb_cg_peer", mapType: udpLayout.peerType, maxEntries: udpLayout.peerCapacity, flags: udpLayout.peerFlags},
++		"cgroup_udp_flow":             {name: "sb_cg_flow", mapType: CiliumEBPF.LRUHash, maxEntries: udpLayout.flowCapacity},
++		"cgroup_uid_policy":           {name: "sb_cg_uid", mapType: CiliumEBPF.LPMTrie, maxEntries: uidCapacity, flags: bpfFlagNoPrealloc},
++		"cgroup_system_resolver_tgid": {name: "sb_cg_resolver", mapType: CiliumEBPF.Hash, maxEntries: maxAndroidSystemResolverTGIDs},
++		"cgroup_bypass_ipv4":          {name: "sb_cg_bypass4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
++		"cgroup_bypass_ipv6":          {name: "sb_cg_bypass6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
++		"cgroup_host_ipv4":            {name: "sb_cg_host4", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
++		"cgroup_host_ipv6":            {name: "sb_cg_host6", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
++		"cgroup_ipv6_available":       {name: "sb_cg_ipv6", mapType: CiliumEBPF.Array, maxEntries: 1},
+ 	})
+ 	if err != nil {
+ 		return err
+@@ -63,6 +61,7 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity,
+ 	runtimeState.udp_peer_map_fd = runtimeState.maps["cgroup_udp_peer"].FD()
+ 	runtimeState.udp_flow_map_fd = runtimeState.maps["cgroup_udp_flow"].FD()
+ 	runtimeState.uid_policy_map_fd = runtimeState.maps["cgroup_uid_policy"].FD()
++	runtimeState.system_resolver_tgid_map_fd = runtimeState.maps["cgroup_system_resolver_tgid"].FD()
+ 	runtimeState.bypass_ipv4_cidr_map_fd = runtimeState.maps["cgroup_bypass_ipv4"].FD()
+ 	runtimeState.bypass_ipv6_cidr_map_fd = runtimeState.maps["cgroup_bypass_ipv6"].FD()
+ 	runtimeState.host_ipv4_map_fd = runtimeState.maps["cgroup_host_ipv4"].FD()
+diff --git a/common/ebpf/cgroup_policy_runtime.go b/common/ebpf/cgroup_policy_runtime.go
+index 3a7fd4e1..d149b4a7 100644
+--- a/common/ebpf/cgroup_policy_runtime.go
++++ b/common/ebpf/cgroup_policy_runtime.go
+@@ -16,6 +16,7 @@ import (
+ 
+ var (
+ 	uidPolicyUpdateBatchSupport  mapBatchSupport
++	uidPolicyDeleteBatchSupport  mapBatchSupport
+ 	bypassCIDRUpdateBatchSupport mapBatchSupport
+ 	bypassCIDRDeleteBatchSupport mapBatchSupport
+ )
+diff --git a/common/ebpf/cgroup_program.go b/common/ebpf/cgroup_program.go
+index 54c6e572..0081628e 100644
+--- a/common/ebpf/cgroup_program.go
++++ b/common/ebpf/cgroup_program.go
+@@ -284,6 +284,9 @@ func (b *CgroupBackend) updateCgroupControl(listenerPort uint16, selfTGID uint32
+ 	if b.fakeIPIPv6.IsValid() {
+ 		flags |= cgroupFlagFakeIPIPv6
+ 	}
++	if b.runtime.system_resolver {
++		flags |= cgroupFlagSystemResolver
++	}
+ 	ipv4Prefix, ipv4HostMask := cgroupIPv4Redirect(b.redirectIPv4)
+ 	control := cgroupControl{
+ 		Flags:                flags,
+diff --git a/common/ebpf/native/abi.h b/common/ebpf/native/abi.h
+index e6fec737..29276c8d 100644
+--- a/common/ebpf/native/abi.h
++++ b/common/ebpf/native/abi.h
+@@ -32,9 +32,15 @@
+ #define SB_EBPF_CGROUP_FLAG_HOST_IPV6 (1U << 14U)
+ #define SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4 (1U << 15U)
+ #define SB_EBPF_CGROUP_FLAG_FAKEIP_IPV6 (1U << 16U)
++#define SB_EBPF_CGROUP_FLAG_SYSTEM_RESOLVER (1U << 17U)
+ #define SB_EBPF_CGROUP_STAT_TCP_REDIRECT_FAILURE 0U
+ #define SB_EBPF_CGROUP_STAT_UDP_REDIRECT_FAILURE 1U
+-#define SB_EBPF_CGROUP_STAT_COUNT 2U
++#define SB_EBPF_CGROUP_STAT_TCP_UID_BYPASS 2U
++#define SB_EBPF_CGROUP_STAT_UDP_UID_BYPASS 3U
++#define SB_EBPF_CGROUP_STAT_RESOLVER_DNS 4U
++#define SB_EBPF_CGROUP_STAT_RESOLVER_TLS 5U
++#define SB_EBPF_CGROUP_STAT_RESOLVER_HTTPS 6U
++#define SB_EBPF_CGROUP_STAT_COUNT 7U
+ 
+ struct sb_ebpf_cgroup_control {
+     __u32 flags;
+diff --git a/common/ebpf/native/cgroup.bpf.c b/common/ebpf/native/cgroup.bpf.c
+index 18c668f4..84dbcae1 100644
+--- a/common/ebpf/native/cgroup.bpf.c
++++ b/common/ebpf/native/cgroup.bpf.c
+@@ -40,6 +40,7 @@ MAP(cgroup_udp_peer, struct sb_ebpf_udp_peer_key, struct sb_ebpf_udp_peer_value,
+ MAP(cgroup_udp_flow, struct sb_ebpf_udp_flow_key, struct sb_ebpf_udp_flow_value, BPF_MAP_TYPE_LRU_HASH);
+ MAP(cgroup_socket_bypass, __u64, __u8, BPF_MAP_TYPE_LRU_HASH);
+ MAP(cgroup_uid_policy, struct sb_ebpf_uid_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
++MAP(cgroup_system_resolver_tgid, __u32, __u8, BPF_MAP_TYPE_HASH);
+ MAP(cgroup_bypass_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
+ MAP(cgroup_bypass_ipv6, struct sb_ebpf_ipv6_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
+ MAP(cgroup_host_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_HASH);
+@@ -87,7 +88,19 @@ INLINE bool is_cookie_bypassed(void *ctx) {
+     return map_lookup(&cgroup_socket_bypass, &cookie) != 0;
+ }
+ 
+-INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config) {
++INLINE bool system_resolver_selected(const struct sb_ebpf_cgroup_control *config, __u16 port) {
++    if ((config->flags & SB_EBPF_CGROUP_FLAG_SYSTEM_RESOLVER) == 0U ||
++        (port != 53U && port != 853U && port != 443U)) return false;
++    __u32 tgid = (__u32)(get_current_pid_tgid() >> 32);
++    if (map_lookup(&cgroup_system_resolver_tgid, &tgid) == 0) return false;
++    __u32 key = port == 53U ? SB_EBPF_CGROUP_STAT_RESOLVER_DNS :
++        (port == 853U ? SB_EBPF_CGROUP_STAT_RESOLVER_TLS : SB_EBPF_CGROUP_STAT_RESOLVER_HTTPS);
++    __u64 *counter = map_lookup(&cgroup_stats, &key);
++    if (counter != 0) __sync_fetch_and_add(counter, 1U);
++    return true;
++}
++
++INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config, __u8 protocol, __u16 port) {
+     if ((config->flags & SB_EBPF_CGROUP_FLAG_UID_POLICY) == 0U) return false;
+     __u32 uid = swap32((__u32)get_current_uid_gid());
+     struct sb_ebpf_uid_lpm_key key = {
+@@ -95,9 +108,15 @@ INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config) {
+     };
+     __builtin_memcpy(key.uid, &uid, sizeof(uid));
+     bool matched = map_lookup(&cgroup_uid_policy, &key) != 0;
+-    return (config->flags & SB_EBPF_CGROUP_FLAG_UID_DEFAULT_BYPASS) != 0U
++    bool bypassed = (config->flags & SB_EBPF_CGROUP_FLAG_UID_DEFAULT_BYPASS) != 0U
+         ? !matched
+         : matched;
++    if (!bypassed || system_resolver_selected(config, port)) return false;
++    __u32 counter_key = protocol == TCP_VALUE ?
++        SB_EBPF_CGROUP_STAT_TCP_UID_BYPASS : SB_EBPF_CGROUP_STAT_UDP_UID_BYPASS;
++    __u64 *counter = map_lookup(&cgroup_stats, &counter_key);
++    if (counter != 0) __sync_fetch_and_add(counter, 1U);
++    return true;
+ }
+ 
+ INLINE bool protocol_selected(const struct sb_ebpf_cgroup_control *config, __u8 protocol) {
+@@ -491,7 +510,7 @@ INLINE int handle_v4(
+     bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
+     bool intercept_dns = port == 53U && config->dns_mode != SB_EBPF_DNS_MODE_OFF;
+     if (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF) return 1;
+-    if (!force_dns && uid_bypassed(config)) return 1;
++    if (!force_dns && uid_bypassed(config, protocol, port)) return 1;
+     if (connected_udp) {
+         reset_connected_udp(cookie);
+         store_udp_peer_v4(cookie, destination, port);
+@@ -577,7 +596,7 @@ INLINE int handle_v6(
+         bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
+         bool intercept_dns = port == 53U && config->dns_mode != SB_EBPF_DNS_MODE_OFF;
+         if (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF) return 1;
+-        if (!force_dns && uid_bypassed(config)) return 1;
++        if (!force_dns && uid_bypassed(config, protocol, port)) return 1;
+         if (connected_udp) {
+             reset_connected_udp(cookie);
+             store_udp_peer_v4(cookie, destination, port);
+@@ -630,7 +649,7 @@ INLINE int handle_v6(
+     bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
+     bool intercept_dns = port == 53U && config->dns_mode != SB_EBPF_DNS_MODE_OFF;
+     if (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF) return 1;
+-    if (!force_dns && uid_bypassed(config)) return 1;
++    if (!force_dns && uid_bypassed(config, protocol, port)) return 1;
+     if (connected_udp) {
+         reset_connected_udp(cookie);
+         store_udp_peer_v6(cookie, address, port);
+diff --git a/common/ebpf/readiness_akihalink.go b/common/ebpf/readiness_akihalink.go
+new file mode 100644
+index 00000000..04013fb0
+--- /dev/null
++++ b/common/ebpf/readiness_akihalink.go
+@@ -0,0 +1,102 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// MarkReady publishes the marker only after the protocol layer has attached
++// the cgroup programs and bound the root-only UID policy control socket.
++func (b *CgroupBackend) MarkReady() error {
++	if b == nil {
++		return errBackendClosed
++	}
++	b.access.RLock()
++	defer b.access.RUnlock()
++	if err := b.health.requireUsable(b.runtime != nil); err != nil {
++		return err
++	}
++	attached := false
++	for _, value := range b.runtime.attached {
++		attached = attached || value
++	}
++	if !attached {
++		return fmt.Errorf("eBPF cgroup programs are not attached")
++	}
++	runtimeDir := os.Getenv("AKIHALINK_RUNTIME")
++	if runtimeDir == "" {
++		return nil
++	}
++	resolver := AndroidSystemResolverStatus{
++		Required:   b.runtime.system_resolver,
++		Discovered: len(b.systemResolverTGIDs),
++	}
++	if resolver.Required && resolver.Discovered == 0 {
++		return fmt.Errorf("Android system resolver is not ready")
++	}
++	startTime, err := currentProcessStartTimeForReadiness()
++	if err != nil {
++		return err
++	}
++	content := fmt.Sprintf(
++		"pid=%d\nstarttime=%s\nstartup_health=healthy\nsystem_resolver_attached=%d\nresolver_discovered=%d\n",
++		os.Getpid(), startTime, boolToInt(!resolver.Required || resolver.Discovered > 0), resolver.Discovered,
++	)
++	return atomicReadinessWrite(filepath.Join(runtimeDir, "core.ready"), []byte(content))
++}
++
++func (b *CgroupBackend) removeReadinessMarker() {
++	runtimeDir := os.Getenv("AKIHALINK_RUNTIME")
++	if runtimeDir != "" {
++		_ = os.Remove(filepath.Join(runtimeDir, "core.ready"))
++	}
++}
++
++func currentProcessStartTimeForReadiness() (string, error) {
++	stat, err := os.ReadFile("/proc/self/stat")
++	if err != nil {
++		return "", err
++	}
++	closeParen := strings.LastIndexByte(string(stat), ')')
++	if closeParen < 0 {
++		return "", fmt.Errorf("invalid process stat")
++	}
++	fields := strings.Fields(string(stat)[closeParen+1:])
++	if len(fields) <= 19 {
++		return "", fmt.Errorf("incomplete process stat")
++	}
++	return fields[19], nil
++}
++
++func atomicReadinessWrite(path string, content []byte) error {
++	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
++		return err
++	}
++	temporary, err := os.CreateTemp(filepath.Dir(path), ".core-ready-*")
++	if err != nil {
++		return err
++	}
++	temporaryPath := temporary.Name()
++	defer os.Remove(temporaryPath)
++	if err = temporary.Chmod(0o600); err == nil {
++		_, err = temporary.Write(content)
++	}
++	if closeErr := temporary.Close(); err == nil {
++		err = closeErr
++	}
++	if err != nil {
++		return err
++	}
++	return os.Rename(temporaryPath, path)
++}
++
++func boolToInt(value bool) int {
++	if value {
++		return 1
++	}
++	return 0
++}
+diff --git a/common/ebpf/readiness_akihalink_test.go b/common/ebpf/readiness_akihalink_test.go
+new file mode 100644
+index 00000000..398dc2e9
+--- /dev/null
++++ b/common/ebpf/readiness_akihalink_test.go
+@@ -0,0 +1,43 @@
++//go:build with_ebpf && linux
++
++package ebpf
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestAtomicReadinessWrite(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "runtime", "core.ready")
++	if err := atomicReadinessWrite(path, []byte("first\n")); err != nil {
++		t.Fatal(err)
++	}
++	if err := atomicReadinessWrite(path, []byte("second\n")); err != nil {
++		t.Fatal(err)
++	}
++	content, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(content) != "second\n" {
++		t.Fatalf("unexpected readiness content: %q", content)
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm() != 0o600 {
++		t.Fatalf("unexpected readiness mode: %o", info.Mode().Perm())
++	}
++}
++
++func TestCurrentProcessStartTimeForReadiness(t *testing.T) {
++	startTime, err := currentProcessStartTimeForReadiness()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if startTime == "" {
++		t.Fatal("empty process start time")
++	}
++}
+diff --git a/common/ebpf/uid_policy_live.go b/common/ebpf/uid_policy_live.go
+new file mode 100644
+index 00000000..8fb9c1ab
+--- /dev/null
++++ b/common/ebpf/uid_policy_live.go
+@@ -0,0 +1,282 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import (
++	"crypto/sha256"
++	"encoding/binary"
++	"encoding/hex"
++	"errors"
++	"slices"
++	"sort"
++	"unsafe"
++
++	E "github.com/sagernet/sing/common/exceptions"
++
++	CiliumEBPF "github.com/cilium/ebpf"
++	"golang.org/x/sys/unix"
++)
++
++type UIDPolicySnapshot struct {
++	LiveFingerprint string
++	EffectiveUIDs   int
++	TCPBypassHits   uint64
++	UDPBypassHits   uint64
++}
++
++func cloneUIDPolicyEntries(entries []uidLPMKey) []uidLPMKey {
++	return slices.Clone(entries)
++}
++
++func cloneCgroupPolicy(policy CgroupPolicy) CgroupPolicy {
++	policy.IncludeUID = slices.Clone(policy.IncludeUID)
++	policy.ExcludeUID = slices.Clone(policy.ExcludeUID)
++	return policy
++}
++
++// ReplaceExcludeUIDPolicy updates the attached LPM trie add-first and
++// delete-second. A failed rollback invalidates the backend so callers rebuild
++// it instead of continuing with an unknown policy.
++func (b *CgroupBackend) ReplaceExcludeUIDPolicy(uidRanges []UIDRange) error {
++	if b == nil {
++		return errBackendClosed
++	}
++	b.access.Lock()
++	defer b.access.Unlock()
++	if err := b.health.requireUsable(b.runtime != nil); err != nil {
++		return err
++	}
++	nextPolicy := cloneCgroupPolicy(b.uidPolicy)
++	nextPolicy.ExcludeUID = slices.Clone(uidRanges)
++	nextEntries, defaultBypass, err := compileUIDPolicy(nextPolicy)
++	if err != nil {
++		return err
++	}
++	if defaultBypass != b.uidDefaultBypass {
++		return E.New("live UID policy update changed default bypass semantics")
++	}
++	if slices.Equal(nextEntries, b.uidPolicyEntries) {
++		b.uidPolicy = nextPolicy
++		return nil
++	}
++	uidMap := b.runtime.maps["cgroup_uid_policy"]
++	if err = replaceUIDPolicyMap(uidMap, b.uidPolicyEntries, nextEntries); err != nil {
++		if policyRollbackFailed(err) {
++			return E.Errors(err, b.health.invalidate("cgroup", "UID policy"))
++		}
++		return err
++	}
++	b.uidPolicyEntries = slices.Clone(nextEntries)
++	b.uidPolicy = nextPolicy
++	return nil
++}
++
++func replaceUIDPolicyMap(mapInstance *CiliumEBPF.Map, currentEntries, nextEntries []uidLPMKey) error {
++	if mapInstance == nil {
++		return errBackendClosed
++	}
++	current := make(map[uidLPMKey]struct{}, len(currentEntries))
++	for _, entry := range currentEntries {
++		current[entry] = struct{}{}
++	}
++	next := make(map[uidLPMKey]struct{}, len(nextEntries))
++	for _, entry := range nextEntries {
++		next[entry] = struct{}{}
++	}
++	additions := make([]uidLPMKey, 0, len(next))
++	for entry := range next {
++		if _, loaded := current[entry]; !loaded {
++			additions = append(additions, entry)
++		}
++	}
++	removals := make([]uidLPMKey, 0, len(current))
++	for entry := range current {
++		if _, loaded := next[entry]; !loaded {
++			removals = append(removals, entry)
++		}
++	}
++	sortUIDPolicyEntries(additions)
++	sortUIDPolicyEntries(removals)
++	added, err := addUIDPolicyEntries(mapInstance, additions)
++	if err != nil {
++		return policyUpdateError(err, rollbackUIDPolicyMap(mapInstance, added, nil))
++	}
++	removed, err := removeUIDPolicyEntries(mapInstance, removals)
++	if err != nil {
++		return policyUpdateError(err, rollbackUIDPolicyMap(mapInstance, added, removed))
++	}
++	return nil
++}
++
++func addUIDPolicyEntries(mapInstance *CiliumEBPF.Map, entries []uidLPMKey) ([]uidLPMKey, error) {
++	if len(entries) == 0 {
++		return nil, nil
++	}
++	values := make([]uint8, len(entries))
++	for index := range values {
++		values[index] = 1
++	}
++	processed, err := updateMapBatch(mapInstance, entries, values, bpfNoExist, &uidPolicyUpdateBatchSupport)
++	if processed > uint32(len(entries)) {
++		return nil, E.New("invalid eBPF UID batch update count: ", processed)
++	}
++	added := slices.Clone(entries[:processed])
++	if err == nil {
++		return added, nil
++	}
++	if !errors.Is(err, unix.EEXIST) && !errors.Is(err, CiliumEBPF.ErrKeyExist) {
++		return added, err
++	}
++	value := uint8(1)
++	for _, entry := range entries[processed:] {
++		err = updateMapWithFlags(mapInstance.FD(), unsafe.Pointer(&entry), unsafe.Pointer(&value), bpfNoExist)
++		if errors.Is(err, unix.EEXIST) || errors.Is(err, CiliumEBPF.ErrKeyExist) {
++			continue
++		}
++		if err != nil {
++			return added, err
++		}
++		added = append(added, entry)
++	}
++	return added, nil
++}
++
++func removeUIDPolicyEntries(mapInstance *CiliumEBPF.Map, entries []uidLPMKey) ([]uidLPMKey, error) {
++	if len(entries) == 0 {
++		return nil, nil
++	}
++	processed, err := deleteMapBatch(mapInstance, entries, &uidPolicyDeleteBatchSupport)
++	if processed > uint32(len(entries)) {
++		return nil, E.New("invalid eBPF UID batch delete count: ", processed)
++	}
++	removed := slices.Clone(entries[:processed])
++	if err == nil {
++		return removed, nil
++	}
++	if !errors.Is(err, unix.ENOENT) && !errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
++		return removed, err
++	}
++	for _, entry := range entries[processed:] {
++		err = deleteMap(mapInstance.FD(), unsafe.Pointer(&entry))
++		if errors.Is(err, unix.ENOENT) || errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
++			continue
++		}
++		if err != nil {
++			return removed, err
++		}
++		removed = append(removed, entry)
++	}
++	return removed, nil
++}
++
++func rollbackUIDPolicyMap(mapInstance *CiliumEBPF.Map, added, removed []uidLPMKey) error {
++	if mapInstance == nil {
++		return errBackendClosed
++	}
++	var rollbackErr error
++	value := uint8(1)
++	for _, entry := range removed {
++		if err := updateMap(mapInstance.FD(), unsafe.Pointer(&entry), unsafe.Pointer(&value)); err != nil {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	for _, entry := range added {
++		if err := deleteMap(mapInstance.FD(), unsafe.Pointer(&entry)); err != nil &&
++			!errors.Is(err, unix.ENOENT) && !errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	return rollbackErr
++}
++
++func (b *CgroupBackend) UIDPolicySnapshot() (UIDPolicySnapshot, error) {
++	if b == nil {
++		return UIDPolicySnapshot{}, errBackendClosed
++	}
++	b.access.RLock()
++	defer b.access.RUnlock()
++	if err := b.health.requireUsable(b.runtime != nil); err != nil {
++		return UIDPolicySnapshot{}, err
++	}
++	entries, err := readUIDPolicyMap(b.runtime.maps["cgroup_uid_policy"])
++	if err != nil {
++		return UIDPolicySnapshot{}, err
++	}
++	tcp, err := b.readCgroupStatLocked(cgroupStatTCPUIDBypass)
++	if err != nil {
++		return UIDPolicySnapshot{}, err
++	}
++	udp, err := b.readCgroupStatLocked(cgroupStatUDPUIDBypass)
++	if err != nil {
++		return UIDPolicySnapshot{}, err
++	}
++	return UIDPolicySnapshot{
++		LiveFingerprint: uidPolicyEntriesFingerprint(entries, b.uidDefaultBypass),
++		EffectiveUIDs:   len(entries),
++		TCPBypassHits:   tcp,
++		UDPBypassHits:   udp,
++	}, nil
++}
++
++func UIDPolicyFingerprint(policy CgroupPolicy) string {
++	entries, defaultBypass, err := compileUIDPolicy(policy)
++	if err != nil {
++		return ""
++	}
++	return uidPolicyEntriesFingerprint(entries, defaultBypass)
++}
++
++func readUIDPolicyMap(mapInstance *CiliumEBPF.Map) ([]uidLPMKey, error) {
++	if mapInstance == nil {
++		return nil, errBackendClosed
++	}
++	entries := make([]uidLPMKey, 0)
++	iterator := mapInstance.Iterate()
++	var key uidLPMKey
++	var value uint8
++	for iterator.Next(&key, &value) {
++		if value != 0 {
++			entries = append(entries, key)
++		}
++	}
++	if err := iterator.Err(); err != nil {
++		return nil, err
++	}
++	sortUIDPolicyEntries(entries)
++	return entries, nil
++}
++
++func sortUIDPolicyEntries(entries []uidLPMKey) {
++	sort.Slice(entries, func(left, right int) bool {
++		if entries[left].PrefixLength != entries[right].PrefixLength {
++			return entries[left].PrefixLength < entries[right].PrefixLength
++		}
++		return binary.BigEndian.Uint32(entries[left].UID[:]) < binary.BigEndian.Uint32(entries[right].UID[:])
++	})
++}
++
++func uidPolicyEntriesFingerprint(entries []uidLPMKey, defaultBypass bool) string {
++	entries = slices.Clone(entries)
++	sortUIDPolicyEntries(entries)
++	hash := sha256.New()
++	if defaultBypass {
++		hash.Write([]byte{1})
++	} else {
++		hash.Write([]byte{0})
++	}
++	var encoded [8]byte
++	for _, entry := range entries {
++		binary.BigEndian.PutUint32(encoded[:4], entry.PrefixLength)
++		copy(encoded[4:], entry.UID[:])
++		hash.Write(encoded[:])
++	}
++	return hex.EncodeToString(hash.Sum(nil))
++}
++
++func (b *CgroupBackend) readCgroupStatLocked(index uint32) (uint64, error) {
++	var value uint64
++	if err := lookupMap(b.statsMapFD, unsafe.Pointer(&index), unsafe.Pointer(&value)); err != nil {
++		return 0, err
++	}
++	return value, nil
++}
+diff --git a/common/ebpf/uid_policy_live_integration_test.go b/common/ebpf/uid_policy_live_integration_test.go
+new file mode 100644
+index 00000000..0013c5f2
+--- /dev/null
++++ b/common/ebpf/uid_policy_live_integration_test.go
+@@ -0,0 +1,68 @@
++//go:build with_ebpf && (linux || android) && ebpf_integration
++
++package ebpf
++
++import (
++	"slices"
++	"testing"
++	"unsafe"
++
++	CiliumEBPF "github.com/cilium/ebpf"
++)
++
++func TestUIDPolicyMapTransactionIntegration(t *testing.T) {
++	requireEBPFIntegration(t, "test transactional UID policy replacement")
++	current := compileUIDRanges([]UIDRange{{Start: 1000, End: 1000}, {Start: 1002, End: 1002}})
++	next := compileUIDRanges([]UIDRange{{Start: 2000, End: 2000}, {Start: 2002, End: 2002}})
++	mapInstance := newUIDPolicyIntegrationMap(t, 4)
++	if err := populateUIDPolicyMap(mapInstance, current); err != nil {
++		t.Fatal(err)
++	}
++	if err := replaceUIDPolicyMap(mapInstance, current, next); err != nil {
++		t.Fatal(err)
++	}
++	assertUIDPolicyIntegrationEntries(t, mapInstance, next)
++}
++
++func TestUIDPolicyMapCapacityFailureRollsBackIntegration(t *testing.T) {
++	requireEBPFIntegration(t, "test UID policy rollback after capacity failure")
++	current := compileUIDRanges([]UIDRange{{Start: 1000, End: 1000}, {Start: 1002, End: 1002}})
++	next := compileUIDRanges([]UIDRange{{Start: 2000, End: 2000}, {Start: 2002, End: 2002}})
++	mapInstance := newUIDPolicyIntegrationMap(t, 3)
++	if err := populateUIDPolicyMap(mapInstance, current); err != nil {
++		t.Fatal(err)
++	}
++	if err := replaceUIDPolicyMap(mapInstance, current, next); err == nil {
++		t.Fatal("expected add-before-delete replacement to fail at map capacity")
++	}
++	assertUIDPolicyIntegrationEntries(t, mapInstance, current)
++}
++
++func newUIDPolicyIntegrationMap(t *testing.T, capacity uint32) *CiliumEBPF.Map {
++	t.Helper()
++	mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
++		Type:       CiliumEBPF.LPMTrie,
++		KeySize:    uint32(unsafe.Sizeof(uidLPMKey{})),
++		ValueSize:  uint32(unsafe.Sizeof(uint8(0))),
++		MaxEntries: capacity,
++		Flags:      bpfFlagNoPrealloc,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = mapInstance.Close() })
++	return mapInstance
++}
++
++func assertUIDPolicyIntegrationEntries(t *testing.T, mapInstance *CiliumEBPF.Map, expected []uidLPMKey) {
++	t.Helper()
++	actual, err := readUIDPolicyMap(mapInstance)
++	if err != nil {
++		t.Fatal(err)
++	}
++	expected = slices.Clone(expected)
++	sortUIDPolicyEntries(expected)
++	if !slices.Equal(actual, expected) {
++		t.Fatalf("unexpected UID policy map contents: got=%v expected=%v", actual, expected)
++	}
++}
+diff --git a/common/ebpf/uid_policy_live_test.go b/common/ebpf/uid_policy_live_test.go
+new file mode 100644
+index 00000000..41480301
+--- /dev/null
++++ b/common/ebpf/uid_policy_live_test.go
+@@ -0,0 +1,23 @@
++//go:build with_ebpf && linux
++
++package ebpf
++
++import "testing"
++
++func TestUIDPolicyFingerprintIsNormalized(t *testing.T) {
++	left := CgroupPolicy{ExcludeUID: []UIDRange{{Start: 20, End: 30}, {Start: 10, End: 19}}}
++	right := CgroupPolicy{ExcludeUID: []UIDRange{{Start: 10, End: 30}}}
++	if UIDPolicyFingerprint(left) != UIDPolicyFingerprint(right) {
++		t.Fatal("equivalent UID policies produced different fingerprints")
++	}
++	right.IncludeUIDConfigured = true
++	if UIDPolicyFingerprint(left) == UIDPolicyFingerprint(right) {
++		t.Fatal("default-bypass semantics were omitted from the fingerprint")
++	}
++}
++
++func TestUIDPolicyCapacityIsFixedForLiveUpdates(t *testing.T) {
++	if maxUIDPolicyEntries != 4096 {
++		t.Fatalf("unexpected live UID policy capacity: %d", maxUIDPolicyEntries)
++	}
++}
+diff --git a/common/listener/listener.go b/common/listener/listener.go
+index 08c58eb5..e53073fd 100644
+--- a/common/listener/listener.go
++++ b/common/listener/listener.go
+@@ -46,6 +46,7 @@ type Listener struct {
+ 	packetOutbound       chan *N.PacketBuffer
+ 	packetOutboundClosed chan struct{}
+ 	shutdown             atomic.Bool
++	udpOOBBatchDisabled  atomic.Bool
+ }
+ 
+ type Options struct {
+diff --git a/common/listener/listener_udp.go b/common/listener/listener_udp.go
+index 4915151e..920fbaee 100644
+--- a/common/listener/listener_udp.go
++++ b/common/listener/listener_udp.go
+@@ -125,6 +125,13 @@ func (l *Listener) loopUDPIn() {
+ 			}
+ 		}
+ 	}
++	if l.oobPacketHandler != nil {
++		if batchHandler, isBatchHandler := l.oobPacketHandler.(adapter.OOBPacketBatchHandler); isBatchHandler {
++			if l.loopUDPInOOBBatch(batchHandler) {
++				return
++			}
++		}
++	}
+ 	var buffer *buf.Buffer
+ 	if !l.threadUnsafePacketWriter {
+ 		buffer = buf.NewPacket()
+@@ -302,3 +309,34 @@ func (w *packetWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.
+ 
+ func (w *packetWriter) WriteIsThreadUnsafe() {
+ }
++
++// WriteMsgUDPAddrPortBatch writes datagrams with per-packet control messages.
++// Unsupported or policy-blocked mmsg syscalls permanently select the standard
++// WriteMsgUDPAddrPort path for this listener.
++func (l *Listener) WriteMsgUDPAddrPortBatch(
++	payloads [][]byte,
++	oobs [][]byte,
++	destinations []netip.AddrPort,
++) error {
++	if len(payloads) == 0 || len(payloads) != len(oobs) || len(payloads) != len(destinations) {
++		return os.ErrInvalid
++	}
++	sent := 0
++	if !l.udpOOBBatchDisabled.Load() {
++		batchSent, unsupported, err := writeMsgUDPAddrPortBatch(l.udpConn, payloads, oobs, destinations)
++		sent = batchSent
++		if unsupported {
++			l.udpOOBBatchDisabled.Store(true)
++		} else if err != nil {
++			return err
++		} else if sent == len(payloads) {
++			return nil
++		}
++	}
++	for index := sent; index < len(payloads); index++ {
++		if _, _, err := l.udpConn.WriteMsgUDPAddrPort(payloads[index], oobs[index], destinations[index]); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/include/quic.go b/include/quic.go
+index 42182c29..d5ca440d 100644
+--- a/include/quic.go
++++ b/include/quic.go
+@@ -1,4 +1,4 @@
+-//go:build with_quic
++//go:build with_quic && !with_akihalink_minimal_registry
+ 
+ package include
+ 
+diff --git a/include/registry.go b/include/registry.go
+index fe6fd5b8..f7baf8fe 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -1,3 +1,5 @@
++//go:build !with_akihalink_minimal_registry
++
+ package include
+ 
+ import (
+diff --git a/option/ebpf.go b/option/ebpf.go
+index c2dc1189..9fe27478 100644
+--- a/option/ebpf.go
++++ b/option/ebpf.go
+@@ -34,6 +34,7 @@ type EBPFLocalOptions struct {
+ 
+ type EBPFSharedOptions struct {
+ 	DNSMode              string                           `json:"dns_mode,omitempty" enum:"hijack,respect_policy,off"`
++	AndroidTethering     string                           `json:"android_tethering,omitempty" enum:"wifi"`
+ 	Interface            badoption.Listable[string]       `json:"interface,omitempty"`
+ 	IPv6Mode             string                           `json:"ipv6_mode,omitempty" enum:"always,off"`
+ 	BypassPrivateAddress *bool                            `json:"bypass_private_address,omitempty"`
+diff --git a/protocol/ebpf/android_tethering.go b/protocol/ebpf/android_tethering.go
+new file mode 100644
+index 00000000..c09ca949
+--- /dev/null
++++ b/protocol/ebpf/android_tethering.go
+@@ -0,0 +1,64 @@
++//go:build with_ebpf && android
++
++package ebpf
++
++import (
++	"net"
++	"os/exec"
++	"sort"
++	"time"
++)
++
++const androidTetheringDiscoveryTimeout = 2 * time.Second
++
++func (s *sharedNetwork) androidTetheringInterfaceResolver() func() ([]string, error) {
++	if s == nil || s.inbound.sharedNetworkOptions.AndroidTethering != "wifi" {
++		return nil
++	}
++	return discoverAndroidWifiTetheringInterfaces
++}
++
++func discoverAndroidWifiTetheringInterfaces() ([]string, error) {
++	available, err := net.Interfaces()
++	if err != nil {
++		return nil, err
++	}
++	byName := make(map[string]net.Interface, len(available))
++	for _, networkInterface := range available {
++		byName[networkInterface.Name] = networkInterface
++	}
++	candidates := make(map[string]struct{})
++	for _, service := range []string{"wifi", "tethering"} {
++		command := exec.Command("dumpsys", service)
++		output := make(chan []byte, 1)
++		failures := make(chan error, 1)
++		go func() {
++			content, commandErr := command.Output()
++			if commandErr != nil {
++				failures <- commandErr
++				return
++			}
++			output <- content
++		}()
++		select {
++		case content := <-output:
++			collectAndroidTetheringCandidates(candidates, byName, string(content))
++		case <-failures:
++		case <-time.After(androidTetheringDiscoveryTimeout):
++			_ = command.Process.Kill()
++		}
++	}
++	if len(candidates) == 0 {
++		for name, networkInterface := range byName {
++			if androidWifiAPName.MatchString(name) && len(networkInterface.HardwareAddr) == 6 {
++				candidates[name] = struct{}{}
++			}
++		}
++	}
++	interfaces := make([]string, 0, len(candidates))
++	for name := range candidates {
++		interfaces = append(interfaces, name)
++	}
++	sort.Strings(interfaces)
++	return interfaces, nil
++}
+diff --git a/protocol/ebpf/android_tethering_parse.go b/protocol/ebpf/android_tethering_parse.go
+new file mode 100644
+index 00000000..15bd1231
+--- /dev/null
++++ b/protocol/ebpf/android_tethering_parse.go
+@@ -0,0 +1,36 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import (
++	"net"
++	"regexp"
++	"strings"
++)
++
++var (
++	androidTetheringToken = regexp.MustCompile(`[A-Za-z0-9_.:-]{2,32}`)
++	androidWifiAPName     = regexp.MustCompile(`(?i)^(ap|softap|swlan|wlan[1-9]|wifi[-_]?ap|br[-_]?wifi|br[-_]?wlan)[A-Za-z0-9_.:-]*$`)
++)
++
++func collectAndroidTetheringCandidates(
++	candidates map[string]struct{},
++	available map[string]net.Interface,
++	output string,
++) {
++	for _, line := range strings.Split(output, "\n") {
++		lower := strings.ToLower(line)
++		if !strings.Contains(lower, "tether") && !strings.Contains(lower, "softap") &&
++			!strings.Contains(lower, "hotspot") && !strings.Contains(lower, "downstream") &&
++			!strings.Contains(lower, "interface") {
++			continue
++		}
++		for _, token := range androidTetheringToken.FindAllString(line, -1) {
++			networkInterface, loaded := available[token]
++			if !loaded || len(networkInterface.HardwareAddr) != 6 || !androidWifiAPName.MatchString(token) {
++				continue
++			}
++			candidates[token] = struct{}{}
++		}
++	}
++}
+diff --git a/protocol/ebpf/android_tethering_parse_test.go b/protocol/ebpf/android_tethering_parse_test.go
+new file mode 100644
+index 00000000..cb9e10c3
+--- /dev/null
++++ b/protocol/ebpf/android_tethering_parse_test.go
+@@ -0,0 +1,38 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import (
++	"net"
++	"testing"
++)
++
++func TestCollectAndroidTetheringCandidatesOnlySelectsWiFi(t *testing.T) {
++	mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
++	available := map[string]net.Interface{
++		"ap0":      {Name: "ap0", HardwareAddr: mac},
++		"swlan0":   {Name: "swlan0", HardwareAddr: mac},
++		"br-wifi0": {Name: "br-wifi0", HardwareAddr: mac},
++		"wlan0":    {Name: "wlan0", HardwareAddr: mac},
++		"rndis0":   {Name: "rndis0", HardwareAddr: mac},
++		"bt-pan":   {Name: "bt-pan", HardwareAddr: mac},
++	}
++	candidates := make(map[string]struct{})
++	collectAndroidTetheringCandidates(candidates, available, `
++SoftApManager: interface=ap0
++WiFi tether downstream: swlan0 br-wifi0
++USB tether downstream: rndis0
++Bluetooth tether interface: bt-pan
++upstream interface: wlan0
++`)
++	for _, expected := range []string{"ap0", "swlan0", "br-wifi0"} {
++		if _, loaded := candidates[expected]; !loaded {
++			t.Fatalf("missing Wi-Fi tethering candidate %s: %v", expected, candidates)
++		}
++	}
++	for _, rejected := range []string{"wlan0", "rndis0", "bt-pan"} {
++		if _, loaded := candidates[rejected]; loaded {
++			t.Fatalf("non-Wi-Fi interface %s was selected: %v", rejected, candidates)
++		}
++	}
++}
+diff --git a/protocol/ebpf/android_tethering_stub.go b/protocol/ebpf/android_tethering_stub.go
+new file mode 100644
+index 00000000..c5593bac
+--- /dev/null
++++ b/protocol/ebpf/android_tethering_stub.go
+@@ -0,0 +1,7 @@
++//go:build with_ebpf && linux && !android
++
++package ebpf
++
++func (s *sharedNetwork) androidTetheringInterfaceResolver() func() ([]string, error) {
++	return nil
++}
+diff --git a/protocol/ebpf/config.go b/protocol/ebpf/config.go
+index c0b58cc1..6297bc71 100644
+--- a/protocol/ebpf/config.go
++++ b/protocol/ebpf/config.go
+@@ -6,6 +6,7 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"path/filepath"
++	"runtime"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -182,7 +183,7 @@ func validateSharedOptions(enabled bool, options option.EBPFSharedOptions) error
+ 	if enabled {
+ 		return nil
+ 	}
+-	if options.DNSMode != "" || len(options.Interface) > 0 || options.IPv6Mode != "" || options.BypassPrivateAddress != nil ||
++	if options.DNSMode != "" || options.AndroidTethering != "" || len(options.Interface) > 0 || options.IPv6Mode != "" || options.BypassPrivateAddress != nil ||
+ 		len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
+ 		len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0 ||
+ 		options.StateCapacity != 0 || options.Advanced.TCPriority != 0 ||
+@@ -204,7 +205,17 @@ func normalizeSharedIPv6Mode(mode string) (string, error) {
+ }
+ 
+ func normalizeSharedNetworkOptions(options option.EBPFSharedOptions) (option.EBPFSharedOptions, error) {
+-	if len(options.Interface) == 0 {
++	if options.AndroidTethering != "" {
++		if runtime.GOOS != "android" {
++			return option.EBPFSharedOptions{}, E.New("shared.android_tethering is only supported on Android")
++		}
++		if options.AndroidTethering != "wifi" {
++			return option.EBPFSharedOptions{}, E.New("unknown shared.android_tethering: ", options.AndroidTethering)
++		}
++		if len(options.Interface) != 0 {
++			return option.EBPFSharedOptions{}, E.New("shared.android_tethering and shared.interface are mutually exclusive")
++		}
++	} else if len(options.Interface) == 0 {
+ 		return option.EBPFSharedOptions{}, E.New("shared.interface must not be empty")
+ 	}
+ 	if options.Advanced.TCPriority == 0 {
+diff --git a/protocol/ebpf/inbound.go b/protocol/ebpf/inbound.go
+index 7d985e09..d189b7af 100644
+--- a/protocol/ebpf/inbound.go
++++ b/protocol/ebpf/inbound.go
+@@ -95,6 +95,7 @@ type Inbound struct {
+ 	sharedNetwork              *sharedNetwork
+ 	tcpSpliceEnabled           bool
+ 	tcpSpliceBackend           *ECommon.SpliceBackend
++	uidPolicyControl           *uidPolicyControl
+ 	cgroupBackendAccess        sync.RWMutex
+ 	lifecycleAccess            sync.Mutex
+ 
+diff --git a/protocol/ebpf/inbound_connection.go b/protocol/ebpf/inbound_connection.go
+index 40d895c7..5037275a 100644
+--- a/protocol/ebpf/inbound_connection.go
++++ b/protocol/ebpf/inbound_connection.go
+@@ -8,6 +8,7 @@ import (
+ 	"errors"
+ 	"net"
+ 	"net/netip"
++	"os"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+@@ -119,6 +120,21 @@ func (i *Inbound) isRedirectListenerDestination(destination netip.AddrPort, list
+ }
+ 
+ func (i *Inbound) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {
++	i.newPacket(buffer, oob, source)
++}
++
++func (i *Inbound) NewPacketBatch(buffers []*buf.Buffer, oobs [][]byte, sources []M.Socksaddr) {
++	defer buf.ReleaseMulti(buffers)
++	if len(buffers) != len(oobs) || len(buffers) != len(sources) {
++		i.udpWarnings.packetInfo.warn(i.logger, "read UDP batch: inconsistent batch lengths")
++		return
++	}
++	for index, buffer := range buffers {
++		i.newPacket(buffer, oobs[index], sources[index])
++	}
++}
++
++func (i *Inbound) newPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {
+ 	backend := i.cgroupBackendInstance()
+ 	if backend == nil {
+ 		return
+@@ -273,6 +289,14 @@ type udpPacketWriter struct {
+ 
+ func (w *udpPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+ 	defer buffer.Release()
++	binding, err := w.replyBinding(destination)
++	if err != nil {
++		return err
++	}
++	return w.inbound.listeners.writeUDP(buffer.Bytes(), binding.packetInfo, w.client, binding.address)
++}
++
++func (w *udpPacketWriter) replyBinding(destination M.Socksaddr) (udpRedirectBinding, error) {
+ 	destinationAddress := destination.AddrPort()
+ 	binding, loaded := w.clientState.redirectBinding(destinationAddress)
+ 	if !loaded {
+@@ -294,12 +318,47 @@ func (w *udpPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksadd
+ 				destinationAddress,
+ 				w.clientState,
+ 			)
+-			return E.Cause(err, "recover missing UDP redirect binding for ", destination)
++			return udpRedirectBinding{}, E.Cause(err, "recover missing UDP redirect binding for ", destination)
+ 		}
+ 		w.inbound.diagnostics.localUDPBindingMiss.Add(1)
+ 		w.inbound.diagnostics.localUDPBindingRecovery.Add(1)
+ 	}
+-	return w.inbound.listeners.writeUDP(buffer.Bytes(), binding.packetInfo, w.client, binding.address)
++	return binding, nil
++}
++
++func (w *udpPacketWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
++	defer buf.ReleaseMulti(buffers)
++	if len(buffers) == 0 || len(buffers) != len(destinations) {
++		return os.ErrInvalid
++	}
++	start := 0
++	for start < len(buffers) {
++		firstBinding, err := w.replyBinding(destinations[start])
++		if err != nil {
++			return err
++		}
++		ipv6 := firstBinding.address.Is6()
++		payloads := make([][]byte, 0, len(buffers)-start)
++		packetInfos := make([][]byte, 0, len(buffers)-start)
++		end := start
++		for end < len(buffers) {
++			binding, err := w.replyBinding(destinations[end])
++			if err != nil {
++				return err
++			}
++			if binding.address.Is6() != ipv6 {
++				break
++			}
++			payloads = append(payloads, buffers[end].Bytes())
++			packetInfos = append(packetInfos, binding.packetInfo)
++			end++
++		}
++		if err := w.inbound.listeners.writeUDPBatch(payloads, packetInfos, w.client, ipv6); err != nil {
++			return err
++		}
++		start = end
++	}
++	return nil
+ }
+ 
+ func (w *udpPacketWriter) reserveReplyBinding(destination netip.AddrPort) (udpRedirectBinding, error) {
+diff --git a/protocol/ebpf/inbound_lifecycle.go b/protocol/ebpf/inbound_lifecycle.go
+index 61d93298..b25896ee 100644
+--- a/protocol/ebpf/inbound_lifecycle.go
++++ b/protocol/ebpf/inbound_lifecycle.go
+@@ -82,6 +82,12 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
+ 			if err := backend.Attach(); err != nil {
+ 				return combineStartError(err, i.cleanupStartFailure())
+ 			}
++			if err := i.startUIDPolicyControl(); err != nil {
++				return combineStartError(err, i.cleanupStartFailure())
++			}
++			if err := backend.MarkReady(); err != nil {
++				return combineStartError(E.Cause(err, "publish eBPF inbound readiness"), i.cleanupStartFailure())
++			}
+ 			if i.enableTCP {
+ 				i.startTCPRedirectJanitor()
+ 			}
+@@ -183,6 +189,7 @@ func (i *Inbound) cleanupStartFailure() error {
+ 
+ func (i *Inbound) closeResources() error {
+ 	defer i.logDiagnosticSummary()
++	i.stopUIDPolicyControl()
+ 	i.stopRuntimeStatusReporter()
+ 	i.logRuntimeStatus("shutdown")
+ 	programStatsErr := i.disableProgramRuntimeStats()
+diff --git a/protocol/ebpf/listener.go b/protocol/ebpf/listener.go
+index f402f49e..71d016c2 100644
+--- a/protocol/ebpf/listener.go
++++ b/protocol/ebpf/listener.go
+@@ -222,3 +222,24 @@ func (s *internalListenerSet) writeUDP(
+ 	_, _, err := udpListener.UDPConn().WriteMsgUDPAddrPort(payload, packetInfo, client)
+ 	return err
+ }
++
++func (s *internalListenerSet) writeUDPBatch(
++	payloads [][]byte,
++	packetInfos [][]byte,
++	client netip.AddrPort,
++	ipv6 bool,
++) error {
++	udpListener := s.udp(ipv6)
++	if udpListener == nil {
++		addressFamily := "IPv4"
++		if ipv6 {
++			addressFamily = "IPv6"
++		}
++		return E.New(addressFamily, " eBPF UDP redirect listener is unavailable")
++	}
++	destinations := make([]netip.AddrPort, len(payloads))
++	for index := range destinations {
++		destinations[index] = client
++	}
++	return udpListener.WriteMsgUDPAddrPortBatch(payloads, packetInfos, destinations)
++}
+diff --git a/protocol/ebpf/shared_network.go b/protocol/ebpf/shared_network.go
+index bb523ceb..3c4d644f 100644
+--- a/protocol/ebpf/shared_network.go
++++ b/protocol/ebpf/shared_network.go
+@@ -86,6 +86,9 @@ func newSharedNetwork(inbound *Inbound, options option.EBPFSharedOptions) *share
+ 	if shared.routingTable == 0 {
+ 		shared.routingTable = sharedNetworkRoutingTableDefault
+ 	}
++	if options.AndroidTethering == "wifi" {
++		shared.interfaces = nil
++	}
+ 	shared.udpNat = udpnat.New(shared, shared.preparePacketConnection, inbound.udpTimeout, false)
+ 	return shared
+ }
+@@ -108,14 +111,15 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
+ 		prepareBackend: func() (*ECommon.SharedNetworkBackend, error) {
+ 			return s.prepareBackend(cgroupBackend)
+ 		},
+-		onReady:        s.sharedNetworkReady,
+-		logger:         s.inbound.logger,
+-		interfaces:     s.interfaces,
+-		enableIPv4:     s.inbound.redirectIPv4Prefix.IsValid(),
+-		priority:       s.tcPriority,
+-		networkMonitor: s.inbound.networkManager.NetworkMonitor(),
+-		attachments:    make(map[string]*sharedTCAttachment),
+-		debug:          &s.inbound.debug,
++		onReady:           s.sharedNetworkReady,
++		logger:            s.inbound.logger,
++		interfaces:        s.interfaces,
++		interfaceResolver: s.androidTetheringInterfaceResolver(),
++		enableIPv4:        s.inbound.redirectIPv4Prefix.IsValid(),
++		priority:          s.tcPriority,
++		networkMonitor:    s.inbound.networkManager.NetworkMonitor(),
++		attachments:       make(map[string]*sharedTCAttachment),
++		debug:             &s.inbound.debug,
+ 	}
+ 	if err := s.tcManager.Start(); err != nil {
+ 		return E.Errors(err, s.Close())
+diff --git a/protocol/ebpf/shared_network_tc.go b/protocol/ebpf/shared_network_tc.go
+index 5ac90d56..e7bce25b 100644
+--- a/protocol/ebpf/shared_network_tc.go
++++ b/protocol/ebpf/shared_network_tc.go
+@@ -35,6 +35,7 @@ type sharedTCManager struct {
+ 	onReady           func()
+ 	logger            sharedNetworkLogger
+ 	interfaces        []string
++	interfaceResolver func() ([]string, error)
+ 	enableIPv4        bool
+ 	priority          uint16
+ 	access            sync.Mutex
+@@ -140,8 +141,21 @@ func (m *sharedTCManager) reconcile() (err error) {
+ 			err = E.Errors(err, E.Cause(disableErr, "disable shared-network after reconciliation failure"))
+ 		}
+ 	}()
+-	desired := make(map[string]netlink.Link, len(m.interfaces))
+-	for _, interfaceName := range m.interfaces {
++	m.access.Lock()
++	interfaces := append([]string(nil), m.interfaces...)
++	m.access.Unlock()
++	if m.interfaceResolver != nil {
++		resolved, resolveErr := m.interfaceResolver()
++		if resolveErr != nil {
++			return E.Cause(resolveErr, "discover Android Wi-Fi tethering interfaces")
++		}
++		interfaces = resolved
++		m.access.Lock()
++		m.interfaces = append(m.interfaces[:0], resolved...)
++		m.access.Unlock()
++	}
++	desired := make(map[string]netlink.Link, len(interfaces))
++	for _, interfaceName := range interfaces {
+ 		link, linkErr := netlink.LinkByName(interfaceName)
+ 		if isSharedNetworkLinkNotFound(linkErr) {
+ 			continue
+diff --git a/protocol/ebpf/uid_policy_control.go b/protocol/ebpf/uid_policy_control.go
+new file mode 100644
+index 00000000..bd7d5735
+--- /dev/null
++++ b/protocol/ebpf/uid_policy_control.go
+@@ -0,0 +1,470 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"runtime"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	ECommon "github.com/sagernet/sing-box/common/ebpf"
++
++	"golang.org/x/sys/unix"
++)
++
++const (
++	uidPolicySocketTimeout = 12 * time.Second
++	uidPolicyResetTimeout  = 10 * time.Second
++	androidUserUIDRange    = 100_000
++)
++
++func platformExcludedUIDRanges(goos string) []ECommon.UIDRange {
++	if goos != "android" {
++		return nil
++	}
++	// Android's network-stack service must keep its own control traffic out of
++	// the app-selected proxy path; verified netd resolver traffic is handled by
++	// the dedicated TGID override in the cgroup program.
++	return []ECommon.UIDRange{{Start: 1052, End: 1052}}
++}
++
++type uidPolicyControl struct {
++	listener   net.Listener
++	path       string
++	access     sync.Mutex
++	generation uint64
++	configured []ECommon.UIDRange
++	known      bool
++}
++
++type uidPolicyResetTarget struct {
++	UID         uint32 `json:"uid"`
++	UserID      uint32 `json:"userId"`
++	PackageName string `json:"packageName"`
++}
++
++type uidPolicyUpdateRequest struct {
++	Action          string                 `json:"action,omitempty"`
++	ExcludeUID      []uint32               `json:"exclude_uid,omitempty"`
++	ExcludeUIDRange []string               `json:"exclude_uid_range,omitempty"`
++	Packages        []uidPolicyResetTarget `json:"packages,omitempty"`
++	VerifyUIDs      []uint32               `json:"verifyUids,omitempty"`
++}
++
++type uidPolicyStatus struct {
++	Generation            uint64 `json:"generation"`
++	ConfiguredFingerprint string `json:"configuredFingerprint"`
++	LiveFingerprint       string `json:"liveFingerprint"`
++	EffectiveUIDs         int    `json:"effectiveUids"`
++	TCPBypassHits         uint64 `json:"tcpBypassHits"`
++	UDPBypassHits         uint64 `json:"udpBypassHits"`
++	InSync                bool   `json:"inSync"`
++	Known                 bool   `json:"known"`
++}
++
++type resolverControlStatus struct {
++	Required            bool   `json:"required"`
++	Discovered          int    `json:"discovered"`
++	PlainDNSCapture     uint64 `json:"plainDnsCapture"`
++	DNSOverTLSCapture   uint64 `json:"dnsOverTlsCapture"`
++	DNSOverHTTPSCapture uint64 `json:"dnsOverHttpsCapture"`
++}
++
++type uidPolicyConnectionReset struct {
++	RequestedPackages int      `json:"requestedPackages"`
++	StoppedPackages   int      `json:"stoppedPackages"`
++	VerifiedUIDs      int      `json:"verifiedUids"`
++	RemainingUIDs     []uint32 `json:"remainingUids"`
++}
++
++type uidPolicyUpdateResponse struct {
++	OK              bool                     `json:"ok"`
++	Error           string                   `json:"error,omitempty"`
++	PolicyStatus    uidPolicyStatus          `json:"policyStatus"`
++	ResolverStatus  resolverControlStatus    `json:"resolverStatus"`
++	ConnectionReset uidPolicyConnectionReset `json:"connectionReset"`
++}
++
++func (i *Inbound) startUIDPolicyControl() error {
++	if !i.cgroupEnabled || i.uidPolicyControl != nil {
++		return nil
++	}
++	socketPath := os.Getenv("AKIHALINK_UID_POLICY_SOCKET")
++	if socketPath == "" {
++		if os.Getenv("AKIHALINK_RUNTIME") != "" {
++			return errors.New("eBPF UID policy control socket path is required")
++		}
++		return nil
++	}
++	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
++		return fmt.Errorf("create eBPF UID policy socket directory: %w", err)
++	}
++	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
++		return fmt.Errorf("remove stale eBPF UID policy socket: %w", err)
++	}
++	listener, err := net.Listen("unix", socketPath)
++	if err != nil {
++		return fmt.Errorf("listen for eBPF UID policy updates: %w", err)
++	}
++	if err = os.Chmod(socketPath, 0o600); err != nil {
++		_ = listener.Close()
++		_ = os.Remove(socketPath)
++		return fmt.Errorf("protect eBPF UID policy socket: %w", err)
++	}
++	control := &uidPolicyControl{
++		listener:   listener,
++		path:       socketPath,
++		generation: 1,
++		configured: append([]ECommon.UIDRange(nil), i.cgroupPolicy.ExcludeUID...),
++		known:      true,
++	}
++	status, statusErr := control.status(i)
++	if statusErr != nil || !status.InSync {
++		_ = listener.Close()
++		_ = os.Remove(socketPath)
++		if statusErr != nil {
++			return fmt.Errorf("inspect initial eBPF UID policy: %w", statusErr)
++		}
++		return errors.New("initial eBPF UID policy fingerprint mismatch")
++	}
++	i.uidPolicyControl = control
++	go i.serveUIDPolicyControl(control)
++	return nil
++}
++
++func (i *Inbound) stopUIDPolicyControl() {
++	control := i.uidPolicyControl
++	i.uidPolicyControl = nil
++	if control == nil {
++		return
++	}
++	_ = control.listener.Close()
++	_ = os.Remove(control.path)
++}
++
++func (i *Inbound) serveUIDPolicyControl(control *uidPolicyControl) {
++	for {
++		connection, err := control.listener.Accept()
++		if err != nil {
++			return
++		}
++		unixConnection, loaded := connection.(*net.UnixConn)
++		if !loaded {
++			_ = connection.Close()
++			continue
++		}
++		go i.handleUIDPolicyConnection(control, unixConnection)
++	}
++}
++
++func (i *Inbound) handleUIDPolicyConnection(control *uidPolicyControl, connection *net.UnixConn) {
++	defer connection.Close()
++	_ = connection.SetDeadline(time.Now().Add(uidPolicySocketTimeout))
++	response := uidPolicyUpdateResponse{}
++	if !uidPolicyPeerIsRoot(connection) {
++		response.Error = "UID policy operations require root"
++		_ = json.NewEncoder(connection).Encode(response)
++		return
++	}
++	var request uidPolicyUpdateRequest
++	if err := json.NewDecoder(io.LimitReader(connection, 1<<20)).Decode(&request); err != nil {
++		response.Error = "invalid UID policy request"
++		_ = json.NewEncoder(connection).Encode(response)
++		return
++	}
++	control.access.Lock()
++	defer control.access.Unlock()
++	var err error
++	switch request.Action {
++	case "", "apply":
++		response.PolicyStatus, response.ConnectionReset, err = i.applyExcludedUIDPolicy(control, request)
++	case "status":
++		response.PolicyStatus, err = control.status(i)
++	default:
++		err = errors.New("unknown UID policy action")
++	}
++	response.ResolverStatus, _ = i.resolverStatus()
++	if err != nil {
++		response.Error = err.Error()
++	} else {
++		response.OK = true
++	}
++	_ = json.NewEncoder(connection).Encode(response)
++}
++
++func uidPolicyPeerIsRoot(connection *net.UnixConn) bool {
++	rawConnection, err := connection.SyscallConn()
++	if err != nil {
++		return false
++	}
++	var credential *unix.Ucred
++	var controlErr error
++	err = rawConnection.Control(func(fd uintptr) {
++		credential, controlErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
++	})
++	return err == nil && controlErr == nil && credential != nil && credential.Uid == 0
++}
++
++func (i *Inbound) applyExcludedUIDPolicy(
++	control *uidPolicyControl,
++	request uidPolicyUpdateRequest,
++) (uidPolicyStatus, uidPolicyConnectionReset, error) {
++	ranges, err := parseUIDRanges(request.ExcludeUID, request.ExcludeUIDRange)
++	if err != nil {
++		return control.unknownStatus(), uidPolicyConnectionReset{}, err
++	}
++	ranges = append(ranges, platformExcludedUIDRanges(runtime.GOOS)...)
++	backend := i.cgroupBackendInstance()
++	if backend == nil {
++		return control.unknownStatus(), uidPolicyConnectionReset{}, errors.New("eBPF backend is not available")
++	}
++	previous := append([]ECommon.UIDRange(nil), control.configured...)
++	if err = backend.ReplaceExcludeUIDPolicy(ranges); err != nil {
++		control.known = false
++		return control.unknownStatus(), uidPolicyConnectionReset{}, err
++	}
++	control.generation++
++	forward, err := control.statusFor(i, ranges)
++	if err != nil || !forward.InSync {
++		rollback, rollbackErr := i.rollbackExcludedUIDPolicy(control, backend, previous)
++		if err == nil {
++			err = errors.New("live UID policy fingerprint did not match")
++		}
++		return rollback, uidPolicyConnectionReset{}, errors.Join(err, rollbackErr)
++	}
++	reset, err := resetUIDPolicyProcesses(request.Packages, request.VerifyUIDs)
++	if err != nil {
++		rollback, rollbackErr := i.rollbackExcludedUIDPolicy(control, backend, previous)
++		return rollback, reset, errors.Join(fmt.Errorf("reset affected application processes: %w", err), rollbackErr)
++	}
++	control.configured = append(control.configured[:0], ranges...)
++	control.known = true
++	i.cgroupPolicy.ExcludeUID = append([]ECommon.UIDRange(nil), ranges...)
++	return forward, reset, nil
++}
++
++func (i *Inbound) rollbackExcludedUIDPolicy(
++	control *uidPolicyControl,
++	backend *ECommon.CgroupBackend,
++	previous []ECommon.UIDRange,
++) (uidPolicyStatus, error) {
++	if err := backend.ReplaceExcludeUIDPolicy(previous); err != nil {
++		control.known = false
++		return control.unknownStatus(), err
++	}
++	control.generation++
++	status, err := control.statusFor(i, previous)
++	if err != nil || !status.InSync {
++		control.known = false
++		if err != nil {
++			return control.unknownStatus(), err
++		}
++		return control.unknownStatus(), errors.New("rollback UID policy fingerprint mismatch")
++	}
++	control.configured = append(control.configured[:0], previous...)
++	control.known = true
++	return status, nil
++}
++
++func (control *uidPolicyControl) status(i *Inbound) (uidPolicyStatus, error) {
++	return control.statusFor(i, control.configured)
++}
++
++func (control *uidPolicyControl) statusFor(i *Inbound, configured []ECommon.UIDRange) (uidPolicyStatus, error) {
++	configuredPolicy := i.cgroupPolicy
++	configuredPolicy.ExcludeUID = append([]ECommon.UIDRange(nil), configured...)
++	status := uidPolicyStatus{
++		Generation:            control.generation,
++		ConfiguredFingerprint: ECommon.UIDPolicyFingerprint(configuredPolicy),
++		Known:                 control.known,
++	}
++	backend := i.cgroupBackendInstance()
++	if backend == nil {
++		status.Known = false
++		return status, errors.New("eBPF backend is not available")
++	}
++	live, err := backend.UIDPolicySnapshot()
++	if err != nil {
++		status.Known = false
++		return status, err
++	}
++	status.LiveFingerprint = live.LiveFingerprint
++	status.EffectiveUIDs = live.EffectiveUIDs
++	status.TCPBypassHits = live.TCPBypassHits
++	status.UDPBypassHits = live.UDPBypassHits
++	status.InSync = status.Known && status.ConfiguredFingerprint == status.LiveFingerprint
++	return status, nil
++}
++
++func (control *uidPolicyControl) unknownStatus() uidPolicyStatus {
++	return uidPolicyStatus{Generation: control.generation, Known: false}
++}
++
++func (i *Inbound) resolverStatus() (resolverControlStatus, error) {
++	backend := i.cgroupBackendInstance()
++	if backend == nil {
++		return resolverControlStatus{}, errors.New("eBPF backend is not available")
++	}
++	status, err := backend.AndroidSystemResolverStatus()
++	return resolverControlStatus{
++		Required:            status.Required,
++		Discovered:          status.Discovered,
++		PlainDNSCapture:     status.PlainDNS,
++		DNSOverTLSCapture:   status.DNSOverTLS,
++		DNSOverHTTPSCapture: status.DNSOverHTTPS,
++	}, err
++}
++
++func resetUIDPolicyProcesses(targets []uidPolicyResetTarget, verifyUIDs []uint32) (uidPolicyConnectionReset, error) {
++	result := uidPolicyConnectionReset{RequestedPackages: len(targets)}
++	uniqueTargets := make(map[string]uidPolicyResetTarget, len(targets))
++	for _, target := range targets {
++		if !validUIDPolicyResetTarget(target) {
++			return result, errors.New("invalid affected application package")
++		}
++		uniqueTargets[strconv.FormatUint(uint64(target.UserID), 10)+":"+target.PackageName] = target
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), uidPolicyResetTimeout)
++	defer cancel()
++	orderedTargets := make([]uidPolicyResetTarget, 0, len(uniqueTargets))
++	for _, target := range uniqueTargets {
++		orderedTargets = append(orderedTargets, target)
++	}
++	sort.Slice(orderedTargets, func(left, right int) bool {
++		if orderedTargets[left].UserID != orderedTargets[right].UserID {
++			return orderedTargets[left].UserID < orderedTargets[right].UserID
++		}
++		return orderedTargets[left].PackageName < orderedTargets[right].PackageName
++	})
++	for _, target := range orderedTargets {
++		command := exec.CommandContext(ctx, "cmd", "activity", "force-stop", "--user",
++			strconv.FormatUint(uint64(target.UserID), 10), target.PackageName)
++		if output, err := command.CombinedOutput(); err != nil {
++			return result, fmt.Errorf("force-stop %s: %w: %s", target.PackageName, err, strings.TrimSpace(string(output)))
++		}
++		result.StoppedPackages++
++	}
++	verify := uniqueUIDs(verifyUIDs)
++	for {
++		remaining, err := activeUIDs(verify)
++		if err != nil {
++			return result, err
++		}
++		result.RemainingUIDs = remaining
++		result.VerifiedUIDs = len(verify) - len(remaining)
++		if len(remaining) == 0 {
++			return result, nil
++		}
++		select {
++		case <-ctx.Done():
++			return result, errors.New("affected application processes remained active")
++		case <-time.After(100 * time.Millisecond):
++		}
++	}
++}
++
++func validUIDPolicyResetTarget(target uidPolicyResetTarget) bool {
++	if target.UID < 10_000 || target.UID%androidUserUIDRange > 19_999 ||
++		target.UserID != target.UID/androidUserUIDRange {
++		return false
++	}
++	parts := strings.Split(target.PackageName, ".")
++	if len(parts) < 2 {
++		return false
++	}
++	for _, part := range parts {
++		if part == "" || !isPackageIdentifierStart(part[0]) {
++			return false
++		}
++		for _, character := range part[1:] {
++			if !isPackageIdentifierPart(character) {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func isPackageIdentifierStart(value byte) bool {
++	return value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
++}
++
++func isPackageIdentifierPart(value rune) bool {
++	return isPackageIdentifierStart(byte(value)) || value >= '0' && value <= '9' || value == '_'
++}
++
++func uniqueUIDs(values []uint32) []uint32 {
++	unique := make(map[uint32]struct{}, len(values))
++	for _, value := range values {
++		if value >= 10_000 {
++			unique[value] = struct{}{}
++		}
++	}
++	result := make([]uint32, 0, len(unique))
++	for value := range unique {
++		result = append(result, value)
++	}
++	sort.Slice(result, func(left, right int) bool { return result[left] < result[right] })
++	return result
++}
++
++func activeUIDs(uids []uint32) ([]uint32, error) {
++	if len(uids) == 0 {
++		return nil, nil
++	}
++	requested := make(map[uint32]struct{}, len(uids))
++	for _, uid := range uids {
++		requested[uid] = struct{}{}
++	}
++	entries, err := os.ReadDir("/proc")
++	if err != nil {
++		return nil, err
++	}
++	active := make(map[uint32]struct{})
++	for _, entry := range entries {
++		if !entry.IsDir() {
++			continue
++		}
++		if _, err = strconv.ParseUint(entry.Name(), 10, 32); err != nil {
++			continue
++		}
++		status, readErr := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
++		if readErr != nil {
++			continue
++		}
++		for _, line := range strings.Split(string(status), "\n") {
++			if !strings.HasPrefix(line, "Uid:") {
++				continue
++			}
++			fields := strings.Fields(line)
++			if len(fields) < 2 {
++				break
++			}
++			uid, parseErr := strconv.ParseUint(fields[1], 10, 32)
++			if parseErr == nil {
++				if _, found := requested[uint32(uid)]; found {
++					active[uint32(uid)] = struct{}{}
++				}
++			}
++			break
++		}
++	}
++	remaining := make([]uint32, 0, len(active))
++	for uid := range active {
++		remaining = append(remaining, uid)
++	}
++	sort.Slice(remaining, func(left, right int) bool { return remaining[left] < remaining[right] })
++	return remaining, nil
++}

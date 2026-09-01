@@ -1,0 +1,10 @@
+Ldev/akiha/akihalink/AkihaLinkApplication;
+Ldev/akiha/akihalink/MainActivity;
+Ldev/akiha/akihalink/MainViewModel;
+Ldev/akiha/akihalink/MainUiState;
+Ldev/akiha/akihalink/data/**;
+Ldev/akiha/akihalink/root/**;
+Ldev/akiha/akihalink/config/**;
+Ldev/akiha/akihalink/subscription/**;
+Ldev/akiha/akihalink/ui/**;
+Ldev/akiha/akihalink/performance/**;

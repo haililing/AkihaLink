@@ -1,0 +1,206 @@
+diff --git a/adapter/handler.go b/adapter/handler.go
+index 4f54d186..6ec62569 100644
+--- a/adapter/handler.go
++++ b/adapter/handler.go
+@@ -25,6 +25,10 @@ type OOBPacketHandler interface {
+ 	NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr)
+ }
+ 
++type OOBPacketBatchHandler interface {
++	NewPacketBatch(buffers []*buf.Buffer, oobs [][]byte, sources []M.Socksaddr)
++}
++
+ type PacketConnectionHandler interface {
+ 	NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata InboundContext, onClose N.CloseHandlerFunc)
+ }
+diff --git a/common/listener/listener.go b/common/listener/listener.go
+index 899c1220..199b25d3 100644
+--- a/common/listener/listener.go
++++ b/common/listener/listener.go
+@@ -46,6 +46,7 @@ type Listener struct {
+ 	packetOutbound       chan *N.PacketBuffer
+ 	packetOutboundClosed chan struct{}
+ 	shutdown             atomic.Bool
++	udpOOBBatchDisabled  atomic.Bool
+ }
+ 
+ type Options struct {
+diff --git a/common/listener/listener_udp.go b/common/listener/listener_udp.go
+index 4915151e..c43a3112 100644
+--- a/common/listener/listener_udp.go
++++ b/common/listener/listener_udp.go
+@@ -125,6 +125,13 @@ func (l *Listener) loopUDPIn() {
+ 			}
+ 		}
+ 	}
++	if l.oobPacketHandler != nil {
++		if batchHandler, isBatchHandler := l.oobPacketHandler.(adapter.OOBPacketBatchHandler); isBatchHandler {
++			if l.loopUDPInOOBBatch(batchHandler) {
++				return
++			}
++		}
++	}
+ 	var buffer *buf.Buffer
+ 	if !l.threadUnsafePacketWriter {
+ 		buffer = buf.NewPacket()
+@@ -302,3 +309,35 @@ func (w *packetWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.
+ 
+ func (w *packetWriter) WriteIsThreadUnsafe() {
+ }
++
++// WriteMsgUDPAddrPortBatch writes datagrams with per-packet control messages.
++// Unsupported or policy-blocked mmsg syscalls permanently select the standard
++// WriteMsgUDPAddrPort path for this listener.
++func (l *Listener) WriteMsgUDPAddrPortBatch(
++	payloads [][]byte,
++	oobs [][]byte,
++	destinations []netip.AddrPort,
++) error {
++	if len(payloads) == 0 || len(payloads) != len(oobs) || len(payloads) != len(destinations) {
++		return os.ErrInvalid
++	}
++	sent := 0
++	if !l.udpOOBBatchDisabled.Load() {
++		batchSent, unsupported, err := writeMsgUDPAddrPortBatch(l.udpConn, payloads, oobs, destinations)
++		sent = batchSent
++		if unsupported {
++			l.udpOOBBatchDisabled.Store(true)
++		} else if err != nil {
++			return err
++		} else if sent == len(payloads) {
++			return nil
++		}
++	}
++	for index := sent; index < len(payloads); index++ {
++		_, _, err := l.udpConn.WriteMsgUDPAddrPort(payloads[index], oobs[index], destinations[index])
++		if err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/include/quic.go b/include/quic.go
+index 42182c29..d5ca440d 100644
+--- a/include/quic.go
++++ b/include/quic.go
+@@ -1,4 +1,4 @@
+-//go:build with_quic
++//go:build with_quic && !with_akihalink_minimal_registry
+ 
+ package include
+ 
+diff --git a/include/registry.go b/include/registry.go
+index fe6fd5b8..f7baf8fe 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -1,3 +1,5 @@
++//go:build !with_akihalink_minimal_registry
++
+ package include
+ 
+ import (
+diff --git a/protocol/ebpf/inbound_connection.go b/protocol/ebpf/inbound_connection.go
+index 0b804d1a..5cfbab74 100644
+--- a/protocol/ebpf/inbound_connection.go
++++ b/protocol/ebpf/inbound_connection.go
+@@ -7,6 +7,7 @@ import (
+ 	"errors"
+ 	"net"
+ 	"net/netip"
++	"os"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+@@ -111,6 +112,21 @@ func (i *Inbound) isRedirectListenerDestination(destination netip.AddrPort) bool
+ }
+ 
+ func (i *Inbound) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {
++	i.newPacket(buffer, oob, source)
++}
++
++func (i *Inbound) NewPacketBatch(buffers []*buf.Buffer, oobs [][]byte, sources []M.Socksaddr) {
++	defer buf.ReleaseMulti(buffers)
++	if len(buffers) != len(oobs) || len(buffers) != len(sources) {
++		i.udpWarnings.packetInfo.warn(i.logger, "read UDP batch: inconsistent batch lengths")
++		return
++	}
++	for index, buffer := range buffers {
++		i.newPacket(buffer, oobs[index], sources[index])
++	}
++}
++
++func (i *Inbound) newPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {
+ 	backend := i.cgroupBackendInstance()
+ 	if backend == nil {
+ 		return
+@@ -228,6 +244,41 @@ func (w *udpPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksadd
+ 	return w.inbound.listeners.writeUDP(buffer.Bytes(), binding.packetInfo, w.client, binding.address)
+ }
+ 
++func (w *udpPacketWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
++	defer buf.ReleaseMulti(buffers)
++	if len(buffers) == 0 || len(buffers) != len(destinations) {
++		return os.ErrInvalid
++	}
++	start := 0
++	for start < len(buffers) {
++		firstBinding, loaded := w.clientState.redirectBinding(destinations[start].AddrPort())
++		if !loaded {
++			return E.New("missing UDP redirect binding for ", destinations[start])
++		}
++		ipv6 := firstBinding.address.Is6()
++		payloads := make([][]byte, 0, len(buffers)-start)
++		packetInfos := make([][]byte, 0, len(buffers)-start)
++		end := start
++		for end < len(buffers) {
++			binding, exists := w.clientState.redirectBinding(destinations[end].AddrPort())
++			if !exists {
++				return E.New("missing UDP redirect binding for ", destinations[end])
++			}
++			if binding.address.Is6() != ipv6 {
++				break
++			}
++			payloads = append(payloads, buffers[end].Bytes())
++			packetInfos = append(packetInfos, binding.packetInfo)
++			end++
++		}
++		if err := w.inbound.listeners.writeUDPBatch(payloads, packetInfos, w.client, ipv6); err != nil {
++			return err
++		}
++		start = end
++	}
++	return nil
++}
++
+ func redirectAddressFromOOB(oob []byte) (netip.Addr, error) {
+ 	for len(oob) > 0 {
+ 		header, data, remainder, err := unix.ParseOneSocketControlMessage(oob)
+diff --git a/protocol/ebpf/listener.go b/protocol/ebpf/listener.go
+index d7312163..9bb56d0e 100644
+--- a/protocol/ebpf/listener.go
++++ b/protocol/ebpf/listener.go
+@@ -183,3 +183,24 @@ func (s *internalListenerSet) writeUDP(
+ 	_, _, err := udpListener.UDPConn().WriteMsgUDPAddrPort(payload, packetInfo, client)
+ 	return err
+ }
++
++func (s *internalListenerSet) writeUDPBatch(
++	payloads [][]byte,
++	packetInfos [][]byte,
++	client netip.AddrPort,
++	ipv6 bool,
++) error {
++	udpListener := s.udp(ipv6)
++	if udpListener == nil {
++		addressFamily := "IPv4"
++		if ipv6 {
++			addressFamily = "IPv6"
++		}
++		return E.New(addressFamily, " eBPF UDP redirect listener is unavailable")
++	}
++	destinations := make([]netip.AddrPort, len(payloads))
++	for index := range destinations {
++		destinations[index] = client
++	}
++	return udpListener.WriteMsgUDPAddrPortBatch(payloads, packetInfos, destinations)
++}

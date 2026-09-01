@@ -1,0 +1,956 @@
+diff --git a/common/ebpf/cgroup_abi_test.go b/common/ebpf/cgroup_abi_test.go
+index 2c47360a..53af5391 100644
+--- a/common/ebpf/cgroup_abi_test.go
++++ b/common/ebpf/cgroup_abi_test.go
+@@ -52,6 +52,12 @@ func TestCgroupRedirectABI(t *testing.T) {
+ }
+ 
+ func TestBypassCIDRABI(t *testing.T) {
++	if size := unsafe.Sizeof(uidLPMKey{}); size != 8 {
++		t.Fatalf("unexpected UID policy key size: %d", size)
++	}
++	if size := unsafe.Sizeof(uidBypassCounter{}); size != 16 {
++		t.Fatalf("unexpected UID bypass counter size: %d", size)
++	}
+ 	if size := unsafe.Sizeof(ipv4CIDRLPMKey{}); size != 8 {
+ 		t.Fatalf("unexpected IPv4 CIDR LPM key size: %d", size)
+ 	}
+diff --git a/common/ebpf/cgroup_backend_cgo.go b/common/ebpf/cgroup_backend_cgo.go
+index 9410b151..55aa8f57 100644
+--- a/common/ebpf/cgroup_backend_cgo.go
++++ b/common/ebpf/cgroup_backend_cgo.go
+@@ -158,6 +158,8 @@ type CgroupBackend struct {
+ 	uidPolicyEntries      []uidLPMKey
+ 	uidPolicy             CgroupPolicy
+ 	uidDefaultBypass      bool
++	uidBypassCounterMapFD        int
++	uidTrackedUIDs               []uint32
+ 	systemResolverTGIDMapFD      int
+ 	systemResolverTGIDs          map[uint32]struct{}
+ 	includeAndroidSystemResolver bool
+@@ -303,6 +305,8 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 		uidPolicyEntries:             slices.Clone(uidPolicyEntries),
+ 		uidPolicy:                    cloneCgroupPolicy(policy),
+ 		uidDefaultBypass:             uidDefaultBypass,
++		uidBypassCounterMapFD:        int(runtimeState.uid_bypass_counter_map_fd),
++		uidTrackedUIDs:               uidPolicyTrackedUIDs(policy.ExcludeUID),
+ 		systemResolverTGIDMapFD:      int(runtimeState.system_resolver_tgid_map_fd),
+ 		systemResolverTGIDs:          make(map[uint32]struct{}),
+ 		includeAndroidSystemResolver: policy.IncludeAndroidSystemResolver,
+@@ -328,6 +332,12 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 		_ = backend.Close()
+ 		return nil, E.Cause(err, "populate UID policy eBPF map")
+ 	}
++	if err = populateUIDBypassCounterMap(
++		int(runtimeState.uid_bypass_counter_map_fd), backend.uidTrackedUIDs,
++	); err != nil {
++		_ = backend.Close()
++		return nil, E.Cause(err, "populate UID bypass counter eBPF map")
++	}
+ 	if err = backend.replaceAndroidSystemResolverTGIDs(systemResolverTGIDs); err != nil {
+ 		_ = backend.Close()
+ 		return nil, E.Cause(err, "initialize Android system resolver eBPF map")
+@@ -577,6 +587,8 @@ func (b *CgroupBackend) Close() error {
+ 		b.uidPolicyMapFD = -1
+ 		b.uidPolicyEntries = nil
+ 		b.uidPolicy = CgroupPolicy{}
++		b.uidBypassCounterMapFD = -1
++		b.uidTrackedUIDs = nil
+ 		b.systemResolverTGIDMapFD = -1
+ 		b.systemResolverTGIDs = nil
+ 		b.includeAndroidSystemResolver = false
+diff --git a/common/ebpf/cgroup_policy.go b/common/ebpf/cgroup_policy.go
+index 12ae16f3..e121a37d 100644
+--- a/common/ebpf/cgroup_policy.go
++++ b/common/ebpf/cgroup_policy.go
+@@ -3,7 +3,9 @@
+ package ebpf
+ 
+ import (
++	"crypto/sha256"
+ 	"encoding/binary"
++	"encoding/hex"
+ 	"math/bits"
+ 	"net/netip"
+ 	"sort"
+@@ -39,6 +41,64 @@ type uidLPMKey struct {
+ 	UID          [4]byte
+ }
+ 
++type UIDPolicyMapSnapshot struct {
++	LiveFingerprint string
++	EffectiveUIDs   int
++	TCPBypassHits   uint64
++	UDPBypassHits   uint64
++}
++
++type uidBypassCounter struct {
++	TCP uint64
++	UDP uint64
++}
++
++func UIDPolicyFingerprint(policy CgroupPolicy) string {
++	entries, defaultBypass, err := compileUIDPolicy(policy)
++	if err != nil {
++		return ""
++	}
++	return uidPolicyEntriesFingerprint(entries, defaultBypass)
++}
++
++func uidPolicyEntriesFingerprint(entries []uidLPMKey, defaultBypass bool) string {
++	sortedEntries := append([]uidLPMKey(nil), entries...)
++	sort.Slice(sortedEntries, func(i, j int) bool {
++		if sortedEntries[i].PrefixLength != sortedEntries[j].PrefixLength {
++			return sortedEntries[i].PrefixLength < sortedEntries[j].PrefixLength
++		}
++		return binary.BigEndian.Uint32(sortedEntries[i].UID[:]) < binary.BigEndian.Uint32(sortedEntries[j].UID[:])
++	})
++	hash := sha256.New()
++	if defaultBypass {
++		_, _ = hash.Write([]byte{1})
++	} else {
++		_, _ = hash.Write([]byte{0})
++	}
++	var raw [8]byte
++	for _, entry := range sortedEntries {
++		binary.BigEndian.PutUint32(raw[:4], entry.PrefixLength)
++		copy(raw[4:], entry.UID[:])
++		_, _ = hash.Write(raw[:])
++	}
++	return hex.EncodeToString(hash.Sum(nil))
++}
++
++func uidPolicyTrackedUIDs(uidRanges []UIDRange) []uint32 {
++	tracked := make(map[uint32]struct{})
++	for _, uidRange := range uidRanges {
++		if uidRange.Start == uidRange.End {
++			tracked[uidRange.Start] = struct{}{}
++		}
++	}
++	values := make([]uint32, 0, len(tracked))
++	for uid := range tracked {
++		values = append(values, uid)
++	}
++	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
++	return values
++}
++
+ type ipv4CIDRLPMKey struct {
+ 	PrefixLength uint32
+ 	Address      [4]byte
+diff --git a/common/ebpf/cgroup_stub.go b/common/ebpf/cgroup_stub.go
+index b0fd1a84..74b81acd 100644
+--- a/common/ebpf/cgroup_stub.go
++++ b/common/ebpf/cgroup_stub.go
+@@ -40,6 +40,10 @@ func (b *CgroupBackend) ReplaceExcludeUIDPolicy([]UIDRange) error {
+ 	return E.New("eBPF inbound is not supported by this build: cgo is disabled")
+ }
+ 
++func (b *CgroupBackend) UIDPolicySnapshot() (UIDPolicyMapSnapshot, error) {
++	return UIDPolicyMapSnapshot{}, E.New("eBPF inbound is not supported by this build: cgo is disabled")
++}
++
+ func (b *CgroupBackend) BypassCIDRCount() (int, int) {
+ 	return 0, 0
+ }
+diff --git a/common/ebpf/map.go b/common/ebpf/map.go
+index 45340af4..feb9efec 100644
+--- a/common/ebpf/map.go
++++ b/common/ebpf/map.go
+@@ -261,6 +261,10 @@ func lookupMapBatch(
+ 	return attribute.Count, nil
+ }
+ 
++func nextMapKey(mapFD int, key unsafe.Pointer, nextKey unsafe.Pointer) error {
++	return mapOperation(bpfMapGetNextKey, mapFD, key, nextKey, 0)
++}
++
+ func updateMapBatch(
+ 	mapFD int,
+ 	keys unsafe.Pointer,
+diff --git a/common/ebpf/native/abi.h b/common/ebpf/native/abi.h
+index d495803e..0f9a0386 100644
+--- a/common/ebpf/native/abi.h
++++ b/common/ebpf/native/abi.h
+@@ -104,6 +104,13 @@ struct sb_ebpf_uid_lpm_key {
+     __u8 uid[4];
+ };
+ 
++struct sb_ebpf_uid_bypass_counter {
++    __u64 tcp;
++    __u64 udp;
++};
++
++_Static_assert(sizeof(struct sb_ebpf_uid_bypass_counter) == 16U, "unexpected UID counter ABI");
++
+ struct sb_ebpf_ipv4_cidr_lpm_key {
+     __u32 prefixlen;
+     __u8 addr[4];
+diff --git a/common/ebpf/native/cgroup.bpf.c b/common/ebpf/native/cgroup.bpf.c
+index ab5602d6..3ee7ec8a 100644
+--- a/common/ebpf/native/cgroup.bpf.c
++++ b/common/ebpf/native/cgroup.bpf.c
+@@ -55,6 +55,7 @@ MAP(cgroup_udp_peer, struct sb_ebpf_udp_peer_key, struct sb_ebpf_udp_peer_value,
+ MAP(cgroup_udp_flow, struct sb_ebpf_udp_flow_key, struct sb_ebpf_udp_flow_value, BPF_MAP_TYPE_LRU_HASH);
+ MAP(cgroup_socket_bypass, __u64, __u8, BPF_MAP_TYPE_LRU_HASH);
+ MAP(cgroup_uid_policy, struct sb_ebpf_uid_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
++MAP(cgroup_uid_bypass_counter, __u32, struct sb_ebpf_uid_bypass_counter, BPF_MAP_TYPE_HASH);
+ MAP(cgroup_system_resolver_tgid, __u32, __u8, BPF_MAP_TYPE_HASH);
+ MAP(cgroup_bypass_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
+ MAP(cgroup_bypass_ipv6, struct sb_ebpf_ipv6_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
+@@ -108,7 +109,18 @@ INLINE bool system_resolver_selected(const struct sb_ebpf_cgroup_control *config
+     return map_lookup(&cgroup_system_resolver_tgid, &tgid) != 0;
+ }
+ 
+-INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config, __u16 port) {
++INLINE void record_uid_bypass(__u32 uid, __u8 protocol) {
++    struct sb_ebpf_uid_bypass_counter *counter =
++        map_lookup(&cgroup_uid_bypass_counter, &uid);
++    if (counter == 0) return;
++    if (protocol == TCP_VALUE) {
++        __sync_fetch_and_add(&counter->tcp, 1U);
++    } else if (protocol == UDP_VALUE) {
++        __sync_fetch_and_add(&counter->udp, 1U);
++    }
++}
++
++INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config, __u8 protocol, __u16 port) {
+     if ((config->flags & SB_EBPF_CGROUP_FLAG_UID_POLICY) == 0U) return false;
+     __u32 raw_uid = (__u32)get_current_uid_gid();
+     __u32 uid = swap32(raw_uid);
+@@ -120,7 +132,9 @@ INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config, __u16 port
+     bool bypassed = (config->flags & SB_EBPF_CGROUP_FLAG_UID_DEFAULT_BYPASS) != 0U
+         ? !matched
+         : matched;
+-    return bypassed && !system_resolver_selected(config, port);
++    if (!bypassed || system_resolver_selected(config, port)) return false;
++    record_uid_bypass(raw_uid, protocol);
++    return true;
+ }
+ 
+ INLINE bool protocol_selected(const struct sb_ebpf_cgroup_control *config, __u8 protocol) {
+@@ -177,7 +191,7 @@ INLINE bool base_bypass(void *ctx, const struct sb_ebpf_cgroup_control *config,
+     if (!protocol_selected(config, protocol)) return true;
+     if (service_port(protocol, port)) return true;
+     if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) == 0U && port == 53U) return true;
+-    if (uid_bypassed(config, port)) return true;
++    if (uid_bypassed(config, protocol, port)) return true;
+     return false;
+ }
+ 
+diff --git a/common/ebpf/native/cgroup_loader.c b/common/ebpf/native/cgroup_loader.c
+index 9e2bc6da..185391c7 100644
+--- a/common/ebpf/native/cgroup_loader.c
++++ b/common/ebpf/native/cgroup_loader.c
+@@ -211,6 +211,7 @@ static int cgroup_object_map_fd(const char *name, void *context) {
+         MAP_BINDING("cgroup_udp_flow", udp_flow_map_fd),
+         MAP_BINDING("cgroup_socket_bypass", bypass_socket_cookie_map_fd),
+         MAP_BINDING("cgroup_uid_policy", uid_policy_map_fd),
++        MAP_BINDING("cgroup_uid_bypass_counter", uid_bypass_counter_map_fd),
+         MAP_BINDING("cgroup_system_resolver_tgid", system_resolver_tgid_map_fd),
+         MAP_BINDING("cgroup_bypass_ipv4", bypass_ipv4_cidr_map_fd),
+         MAP_BINDING("cgroup_bypass_ipv6", bypass_ipv6_cidr_map_fd),
+diff --git a/common/ebpf/native/cgroup_runtime.c b/common/ebpf/native/cgroup_runtime.c
+index 61d5fcb5..b4865b8d 100644
+--- a/common/ebpf/native/cgroup_runtime.c
++++ b/common/ebpf/native/cgroup_runtime.c
+@@ -95,6 +95,9 @@ int sb_ebpf_cgroup_prepare(
+         {"UID policy", (enum bpf_map_type)SB_EBPF_LPM_TRIE_MAP_TYPE,
+          sizeof(struct sb_ebpf_uid_lpm_key), sizeof(uint8_t), SB_EBPF_MAX_POLICY_MAP_ENTRIES,
+          BPF_F_NO_PREALLOC, &runtime->uid_policy_map_fd},
++        {"UID bypass counters", (enum bpf_map_type)SB_EBPF_HASH_MAP_TYPE,
++         sizeof(uint32_t), sizeof(struct sb_ebpf_uid_bypass_counter),
++         SB_EBPF_MAX_POLICY_MAP_ENTRIES, 0U, &runtime->uid_bypass_counter_map_fd},
+         {"system resolver TGID", (enum bpf_map_type)SB_EBPF_HASH_MAP_TYPE,
+          sizeof(uint32_t), sizeof(uint8_t), SB_EBPF_MAX_SYSTEM_RESOLVER_TGIDS,
+          0U, &runtime->system_resolver_tgid_map_fd},
+@@ -235,6 +238,7 @@ int sb_ebpf_cgroup_close(struct sb_ebpf_cgroup_runtime *runtime) {
+         }
+     }
+     int *runtime_fds[] = {
++        &runtime->uid_bypass_counter_map_fd,
+         &runtime->system_resolver_tgid_map_fd,
+         &runtime->uid_policy_map_fd,
+         &runtime->bypass_ipv6_cidr_map_fd,
+diff --git a/common/ebpf/native/runtime.h b/common/ebpf/native/runtime.h
+index f70e0d1b..edb9ac81 100644
+--- a/common/ebpf/native/runtime.h
++++ b/common/ebpf/native/runtime.h
+@@ -64,6 +64,7 @@ struct sb_ebpf_cgroup_runtime {
+     int udp_flow_map_fd;
+     int bypass_socket_cookie_map_fd;
+     int uid_policy_map_fd;
++    int uid_bypass_counter_map_fd;
+     int system_resolver_tgid_map_fd;
+     int bypass_ipv4_cidr_map_fd;
+     int bypass_ipv6_cidr_map_fd;
+diff --git a/common/ebpf/uid_policy_live.go b/common/ebpf/uid_policy_live.go
+index 8070540d..12fbeb74 100644
+--- a/common/ebpf/uid_policy_live.go
++++ b/common/ebpf/uid_policy_live.go
+@@ -32,27 +32,203 @@ func (b *CgroupBackend) ReplaceExcludeUIDPolicy(uidRanges []UIDRange) error {
+ 	if defaultBypass != b.uidDefaultBypass {
+ 		return E.New("live UID policy update changed default bypass semantics")
+ 	}
+-	if slices.Equal(entries, b.uidPolicyEntries) {
++	nextTrackedUIDs := uidPolicyTrackedUIDs(nextPolicy.ExcludeUID)
++	policyChanged := !slices.Equal(entries, b.uidPolicyEntries)
++	countersChanged := !slices.Equal(nextTrackedUIDs, b.uidTrackedUIDs)
++	if !policyChanged && !countersChanged {
+ 		b.uidPolicy = nextPolicy
+ 		return nil
+ 	}
+-	if err = replaceUIDPolicyMap(b.uidPolicyMapFD, b.uidPolicyEntries, entries); err != nil {
++	var currentCounters map[uint32]uidBypassCounter
++	if countersChanged {
++		currentCounters, err = readUIDBypassCounterMap(b.uidBypassCounterMapFD)
++		if err != nil {
++			return E.Cause(err, "read UID bypass counter eBPF map")
++		}
++	}
++	if policyChanged {
++		err = replaceUIDPolicyMap(b.uidPolicyMapFD, b.uidPolicyEntries, entries)
++	}
++	if err != nil {
+ 		if policyRollbackFailed(err) {
+ 			return E.Errors(err, b.health.invalidate("cgroup", "UID policy"))
+ 		}
+ 		return err
+ 	}
++	if countersChanged {
++		err = replaceUIDBypassCounterMap(b.uidBypassCounterMapFD, currentCounters, nextTrackedUIDs)
++		if err != nil {
++			if policyChanged {
++				err = policyUpdateError(err, replaceUIDPolicyMap(b.uidPolicyMapFD, entries, b.uidPolicyEntries))
++			}
++			if policyRollbackFailed(err) {
++				return E.Errors(err, b.health.invalidate("cgroup", "UID policy"))
++			}
++			return err
++		}
++	}
+ 	b.uidPolicyEntries = slices.Clone(entries)
++	b.uidTrackedUIDs = slices.Clone(nextTrackedUIDs)
+ 	b.uidPolicy = nextPolicy
+ 	return nil
+ }
+ 
++func (b *CgroupBackend) UIDPolicySnapshot() (UIDPolicyMapSnapshot, error) {
++	if b == nil {
++		return UIDPolicyMapSnapshot{}, errBackendClosed
++	}
++	b.access.RLock()
++	defer b.access.RUnlock()
++	if err := b.health.requireUsable(b.runtime != nil); err != nil {
++		return UIDPolicyMapSnapshot{}, err
++	}
++	entries, err := readUIDPolicyMap(b.uidPolicyMapFD)
++	if err != nil {
++		return UIDPolicyMapSnapshot{}, E.Cause(err, "read UID policy eBPF map")
++	}
++	snapshot := UIDPolicyMapSnapshot{
++		LiveFingerprint: uidPolicyEntriesFingerprint(entries, b.uidDefaultBypass),
++	}
++	counters, err := readUIDBypassCounterMap(b.uidBypassCounterMapFD)
++	if err != nil {
++		return UIDPolicyMapSnapshot{}, E.Cause(err, "read UID bypass counter eBPF map")
++	}
++	snapshot.EffectiveUIDs = len(counters)
++	for _, counter := range counters {
++		snapshot.TCPBypassHits += counter.TCP
++		snapshot.UDPBypassHits += counter.UDP
++	}
++	return snapshot, nil
++}
++
+ func cloneCgroupPolicy(policy CgroupPolicy) CgroupPolicy {
+ 	policy.IncludeUID = slices.Clone(policy.IncludeUID)
+ 	policy.ExcludeUID = slices.Clone(policy.ExcludeUID)
+ 	return policy
+ }
+ 
++func readUIDPolicyMap(mapFD int) ([]uidLPMKey, error) {
++	if mapFD < 0 {
++		return nil, errBackendClosed
++	}
++	entries := make([]uidLPMKey, 0)
++	var current uidLPMKey
++	var currentPointer unsafe.Pointer
++	for {
++		var next uidLPMKey
++		err := nextMapKey(mapFD, currentPointer, unsafe.Pointer(&next))
++		if errors.Is(err, unix.ENOENT) {
++			return entries, nil
++		}
++		if err != nil {
++			return nil, err
++		}
++		var value uint8
++		if err = lookupMap(mapFD, unsafe.Pointer(&next), unsafe.Pointer(&value)); err != nil {
++			return nil, err
++		}
++		entries = append(entries, next)
++		current = next
++		currentPointer = unsafe.Pointer(&current)
++	}
++}
++
++func populateUIDBypassCounterMap(mapFD int, uids []uint32) error {
++	return replaceUIDBypassCounterMap(mapFD, nil, uids)
++}
++
++func replaceUIDBypassCounterMap(
++	mapFD int,
++	current map[uint32]uidBypassCounter,
++	nextUIDs []uint32,
++) error {
++	if mapFD < 0 {
++		return errBackendClosed
++	}
++	next := make(map[uint32]struct{}, len(nextUIDs))
++	for _, uid := range nextUIDs {
++		next[uid] = struct{}{}
++	}
++	added := make([]uint32, 0, len(next))
++	for uid := range next {
++		if _, exists := current[uid]; exists {
++			continue
++		}
++		key := uid
++		value := uidBypassCounter{}
++		if err := updateMapWithFlags(mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value), bpfNoExist); err != nil {
++			if errors.Is(err, unix.EEXIST) {
++				continue
++			}
++			return policyUpdateError(err, rollbackUIDBypassCounterMap(mapFD, added, nil))
++		}
++		added = append(added, uid)
++	}
++	removed := make(map[uint32]uidBypassCounter)
++	for uid, counter := range current {
++		if _, keep := next[uid]; keep {
++			continue
++		}
++		key := uid
++		if err := deleteMap(mapFD, unsafe.Pointer(&key)); err != nil {
++			if errors.Is(err, unix.ENOENT) {
++				continue
++			}
++			return policyUpdateError(err, rollbackUIDBypassCounterMap(mapFD, added, removed))
++		}
++		removed[uid] = counter
++	}
++	return nil
++}
++
++func readUIDBypassCounterMap(mapFD int) (map[uint32]uidBypassCounter, error) {
++	if mapFD < 0 {
++		return nil, errBackendClosed
++	}
++	counters := make(map[uint32]uidBypassCounter)
++	var current uint32
++	var currentPointer unsafe.Pointer
++	for {
++		var next uint32
++		err := nextMapKey(mapFD, currentPointer, unsafe.Pointer(&next))
++		if errors.Is(err, unix.ENOENT) {
++			return counters, nil
++		}
++		if err != nil {
++			return nil, err
++		}
++		var counter uidBypassCounter
++		if err = lookupMap(mapFD, unsafe.Pointer(&next), unsafe.Pointer(&counter)); err != nil {
++			return nil, err
++		}
++		counters[next] = counter
++		current = next
++		currentPointer = unsafe.Pointer(&current)
++	}
++}
++
++func rollbackUIDBypassCounterMap(
++	mapFD int,
++	added []uint32,
++	removed map[uint32]uidBypassCounter,
++) error {
++	var rollbackErr error
++	for uid, counter := range removed {
++		key := uid
++		value := counter
++		if err := updateMap(mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	for _, uid := range added {
++		key := uid
++		if err := deleteMap(mapFD, unsafe.Pointer(&key)); err != nil && !errors.Is(err, unix.ENOENT) {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	return rollbackErr
++}
++
+ func replaceUIDPolicyMap(mapFD int, currentEntries []uidLPMKey, nextEntries []uidLPMKey) error {
+ 	if mapFD < 0 {
+ 		return errBackendClosed
+diff --git a/common/ebpf/uid_policy_status_test.go b/common/ebpf/uid_policy_status_test.go
+new file mode 100644
+index 00000000..3f24c187
+--- /dev/null
++++ b/common/ebpf/uid_policy_status_test.go
+@@ -0,0 +1,47 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import "testing"
++
++func TestUIDPolicyFingerprintIsOrderIndependent(t *testing.T) {
++	first := CgroupPolicy{ExcludeUID: []UIDRange{
++		{Start: 20_123, End: 20_123},
++		{Start: 10_123, End: 10_123},
++	}}
++	second := CgroupPolicy{ExcludeUID: []UIDRange{
++		{Start: 10_123, End: 10_123},
++		{Start: 20_123, End: 20_123},
++	}}
++	if UIDPolicyFingerprint(first) != UIDPolicyFingerprint(second) {
++		t.Fatal("UID policy fingerprint changed with input order")
++	}
++}
++
++func TestUIDPolicyFingerprintCoversCombinedSemantics(t *testing.T) {
++	exclude := CgroupPolicy{ExcludeUID: []UIDRange{{Start: 10_123, End: 10_123}}}
++	include := CgroupPolicy{
++		IncludeUIDConfigured: true,
++		IncludeUID:           []UIDRange{{Start: 10_123, End: 10_123}},
++	}
++	if UIDPolicyFingerprint(exclude) == UIDPolicyFingerprint(include) {
++		t.Fatal("UID policy fingerprint ignored default bypass semantics")
++	}
++
++	withExcludedInclude := include
++	withExcludedInclude.ExcludeUID = []UIDRange{{Start: 10_123, End: 10_123}}
++	if UIDPolicyFingerprint(include) == UIDPolicyFingerprint(withExcludedInclude) {
++		t.Fatal("UID policy fingerprint ignored include/exclude precedence")
++	}
++}
++
++func TestUIDPolicyTrackedUIDsIgnoreRanges(t *testing.T) {
++	tracked := uidPolicyTrackedUIDs([]UIDRange{
++		{Start: 10_123, End: 10_123},
++		{Start: 10_123, End: 10_123},
++		{Start: 20_000, End: 20_010},
++	})
++	if len(tracked) != 1 || tracked[0] != 10_123 {
++		t.Fatalf("unexpected tracked UIDs: %v", tracked)
++	}
++}
+diff --git a/protocol/ebpf/uid_policy_control.go b/protocol/ebpf/uid_policy_control.go
+index b62c9eb7..e16071c2 100644
+--- a/protocol/ebpf/uid_policy_control.go
++++ b/protocol/ebpf/uid_policy_control.go
+@@ -3,32 +3,77 @@
+ package ebpf
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"net"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
+ 	"runtime"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
+ 	"time"
+ 
+ 	ECommon "github.com/sagernet/sing-box/common/ebpf"
+ 	"golang.org/x/sys/unix"
+ )
+ 
++const (
++	uidPolicyResetTimeout = 8 * time.Second
++	androidUserUIDRange   = 100_000
++)
++
+ type uidPolicyControl struct {
+-	listener net.Listener
+-	path     string
++	listener   net.Listener
++	path       string
++	access     sync.Mutex
++	generation uint64
++	configured []ECommon.UIDRange
++	known      bool
++}
++
++type uidPolicyResetTarget struct {
++	UID         uint32 `json:"uid"`
++	UserID      uint32 `json:"userId"`
++	PackageName string `json:"packageName"`
+ }
+ 
+ type uidPolicyUpdateRequest struct {
+-	ExcludeUID      []uint32 `json:"exclude_uid"`
+-	ExcludeUIDRange []string `json:"exclude_uid_range"`
++	Action          string                 `json:"action,omitempty"`
++	ExcludeUID      []uint32               `json:"exclude_uid,omitempty"`
++	ExcludeUIDRange []string               `json:"exclude_uid_range,omitempty"`
++	Packages        []uidPolicyResetTarget `json:"packages,omitempty"`
++	VerifyUIDs      []uint32               `json:"verifyUids,omitempty"`
++}
++
++type uidPolicyStatus struct {
++	Generation            uint64 `json:"generation"`
++	ConfiguredFingerprint string `json:"configuredFingerprint"`
++	LiveFingerprint       string `json:"liveFingerprint"`
++	EffectiveUIDs         int    `json:"effectiveUids"`
++	TCPBypassHits         uint64 `json:"tcpBypassHits"`
++	UDPBypassHits         uint64 `json:"udpBypassHits"`
++	InSync                bool   `json:"inSync"`
++	Known                 bool   `json:"known"`
++}
++
++type uidPolicyConnectionReset struct {
++	RequestedPackages int      `json:"requestedPackages"`
++	StoppedPackages   int      `json:"stoppedPackages"`
++	VerifiedUIDs      int      `json:"verifiedUids"`
++	RemainingUIDs     []uint32 `json:"remainingUids"`
+ }
+ 
+ type uidPolicyUpdateResponse struct {
+-	OK    bool   `json:"ok"`
+-	Error string `json:"error,omitempty"`
++	OK              bool                     `json:"ok"`
++	Error           string                   `json:"error,omitempty"`
++	PolicyStatus    uidPolicyStatus          `json:"policyStatus"`
++	ConnectionReset uidPolicyConnectionReset `json:"connectionReset"`
+ }
+ 
+ func (i *Inbound) startUIDPolicyControl() {
+@@ -58,7 +103,14 @@ func (i *Inbound) startUIDPolicyControl() {
+ 		i.logger.Warn("protect eBPF UID policy socket: ", err)
+ 		return
+ 	}
+-	control := &uidPolicyControl{listener: listener, path: socketPath}
++	control := &uidPolicyControl{
++		listener: listener, path: socketPath, generation: 1,
++		configured: append([]ECommon.UIDRange(nil), i.cgroupPolicy.ExcludeUID...), known: true,
++	}
++	if _, err = control.status(i); err != nil {
++		control.known = false
++		i.logger.Warn("inspect initial eBPF UID policy: ", err)
++	}
+ 	i.uidPolicyControl = control
+ 	go i.serveUIDPolicyControl(control)
+ }
+@@ -84,13 +136,13 @@ func (i *Inbound) serveUIDPolicyControl(control *uidPolicyControl) {
+ 			_ = connection.Close()
+ 			continue
+ 		}
+-		go i.handleUIDPolicyConnection(unixConnection)
++		go i.handleUIDPolicyConnection(control, unixConnection)
+ 	}
+ }
+ 
+-func (i *Inbound) handleUIDPolicyConnection(connection *net.UnixConn) {
++func (i *Inbound) handleUIDPolicyConnection(control *uidPolicyControl, connection *net.UnixConn) {
+ 	defer connection.Close()
+-	_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
++	_ = connection.SetDeadline(time.Now().Add(uidPolicyResetTimeout + 2*time.Second))
+ 	response := uidPolicyUpdateResponse{}
+ 	if !uidPolicyPeerIsRoot(connection) {
+ 		response.Error = "UID policy updates require root"
+@@ -103,7 +155,28 @@ func (i *Inbound) handleUIDPolicyConnection(connection *net.UnixConn) {
+ 		_ = json.NewEncoder(connection).Encode(response)
+ 		return
+ 	}
+-	if err := i.updateExcludedUIDPolicy(request); err != nil {
++	control.access.Lock()
++	defer control.access.Unlock()
++	if request.Action == "status" {
++		status, err := control.status(i)
++		if err != nil {
++			response.Error = err.Error()
++		} else {
++			response.OK = true
++			response.PolicyStatus = status
++		}
++		_ = json.NewEncoder(connection).Encode(response)
++		return
++	}
++	if request.Action != "" && request.Action != "apply" {
++		response.Error = "unknown UID policy action"
++		_ = json.NewEncoder(connection).Encode(response)
++		return
++	}
++	status, reset, err := i.applyExcludedUIDPolicy(control, request)
++	response.PolicyStatus = status
++	response.ConnectionReset = reset
++	if err != nil {
+ 		response.Error = err.Error()
+ 	} else {
+ 		response.OK = true
+@@ -124,19 +197,250 @@ func uidPolicyPeerIsRoot(connection *net.UnixConn) bool {
+ 	return err == nil && controlErr == nil && credential != nil && credential.Uid == 0
+ }
+ 
+-func (i *Inbound) updateExcludedUIDPolicy(request uidPolicyUpdateRequest) error {
++func (i *Inbound) applyExcludedUIDPolicy(
++	control *uidPolicyControl,
++	request uidPolicyUpdateRequest,
++) (uidPolicyStatus, uidPolicyConnectionReset, error) {
+ 	ranges, err := parseUIDRanges(request.ExcludeUID, request.ExcludeUIDRange)
+ 	if err != nil {
+-		return err
++		return control.unknownStatus(), uidPolicyConnectionReset{}, err
+ 	}
+ 	ranges = append(ranges, platformExcludedUIDRanges(runtime.GOOS)...)
+ 	backend := i.cgroupBackendInstance()
+ 	if backend == nil {
+-		return errors.New("eBPF backend is not available")
++		return control.unknownStatus(), uidPolicyConnectionReset{}, errors.New("eBPF backend is not available")
+ 	}
++	previous := append([]ECommon.UIDRange(nil), control.configured...)
+ 	if err = backend.ReplaceExcludeUIDPolicy(ranges); err != nil {
+-		return err
++		return control.unknownStatus(), uidPolicyConnectionReset{}, err
++	}
++	control.generation++
++	forward, forwardErr := control.statusFor(i, ranges)
++	if forwardErr != nil || !forward.InSync {
++		if forwardErr == nil {
++			forwardErr = errors.New("live eBPF UID policy fingerprint did not match configured policy")
++		}
++		rollback, rollbackErr := i.rollbackExcludedUIDPolicy(control, backend, previous)
++		if rollbackErr != nil {
++			return rollback, uidPolicyConnectionReset{}, fmt.Errorf("verify eBPF UID policy: %w; rollback: %v", forwardErr, rollbackErr)
++		}
++		return rollback, uidPolicyConnectionReset{}, fmt.Errorf("verify eBPF UID policy: %w", forwardErr)
++	}
++	reset, err := resetUIDPolicyProcesses(request.Packages, request.VerifyUIDs)
++	if err != nil {
++		rollback, rollbackErr := i.rollbackExcludedUIDPolicy(control, backend, previous)
++		if rollbackErr != nil {
++			return rollback, reset, fmt.Errorf("reset affected application processes: %w; rollback: %v", err, rollbackErr)
++		}
++		return rollback, reset, fmt.Errorf("reset affected application processes: %w", err)
+ 	}
++	control.configured = append(control.configured[:0], ranges...)
++	control.known = true
+ 	i.cgroupPolicy.ExcludeUID = append([]ECommon.UIDRange(nil), ranges...)
+-	return nil
++	return forward, reset, nil
++}
++
++func (i *Inbound) rollbackExcludedUIDPolicy(
++	control *uidPolicyControl,
++	backend *ECommon.CgroupBackend,
++	previous []ECommon.UIDRange,
++) (uidPolicyStatus, error) {
++	if err := backend.ReplaceExcludeUIDPolicy(previous); err != nil {
++		control.known = false
++		return control.unknownStatus(), err
++	}
++	control.generation++
++	status, err := control.statusFor(i, previous)
++	if err != nil {
++		control.known = false
++		return control.unknownStatus(), fmt.Errorf("verify rollback eBPF UID policy: %w", err)
++	}
++	if !status.InSync {
++		control.known = false
++		return control.unknownStatus(), errors.New("verify rollback eBPF UID policy: live fingerprint did not match")
++	}
++	control.configured = append(control.configured[:0], previous...)
++	control.known = true
++	return status, nil
++}
++
++func (control *uidPolicyControl) status(i *Inbound) (uidPolicyStatus, error) {
++	return control.statusFor(i, control.configured)
++}
++
++func (control *uidPolicyControl) statusFor(i *Inbound, configured []ECommon.UIDRange) (uidPolicyStatus, error) {
++	configuredPolicy := i.cgroupPolicy
++	configuredPolicy.ExcludeUID = append([]ECommon.UIDRange(nil), configured...)
++	status := uidPolicyStatus{
++		Generation:            control.generation,
++		ConfiguredFingerprint: ECommon.UIDPolicyFingerprint(configuredPolicy),
++		Known:                 control.known,
++	}
++	backend := i.cgroupBackendInstance()
++	if backend == nil {
++		status.Known = false
++		return status, errors.New("eBPF backend is not available")
++	}
++	live, err := backend.UIDPolicySnapshot()
++	if err != nil {
++		status.Known = false
++		return status, err
++	}
++	status.LiveFingerprint = live.LiveFingerprint
++	status.EffectiveUIDs = live.EffectiveUIDs
++	status.TCPBypassHits = live.TCPBypassHits
++	status.UDPBypassHits = live.UDPBypassHits
++	status.InSync = status.Known && status.ConfiguredFingerprint == status.LiveFingerprint
++	return status, nil
++}
++
++func (control *uidPolicyControl) unknownStatus() uidPolicyStatus {
++	return uidPolicyStatus{Generation: control.generation, Known: false}
++}
++
++func resetUIDPolicyProcesses(
++	targets []uidPolicyResetTarget,
++	verifyUIDs []uint32,
++) (uidPolicyConnectionReset, error) {
++	result := uidPolicyConnectionReset{RequestedPackages: len(targets)}
++	uniqueTargets := make(map[string]uidPolicyResetTarget, len(targets))
++	for _, target := range targets {
++		if !validUIDPolicyResetTarget(target) {
++			return result, errors.New("invalid affected application package")
++		}
++		uniqueTargets[strconv.FormatUint(uint64(target.UserID), 10)+":"+target.PackageName] = target
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), uidPolicyResetTimeout)
++	defer cancel()
++	orderedTargets := make([]uidPolicyResetTarget, 0, len(uniqueTargets))
++	for _, target := range uniqueTargets {
++		orderedTargets = append(orderedTargets, target)
++	}
++	sort.Slice(orderedTargets, func(a, b int) bool {
++		if orderedTargets[a].UserID != orderedTargets[b].UserID {
++			return orderedTargets[a].UserID < orderedTargets[b].UserID
++		}
++		return orderedTargets[a].PackageName < orderedTargets[b].PackageName
++	})
++	for _, target := range orderedTargets {
++		command := exec.CommandContext(
++			ctx, "cmd", "activity", "force-stop", "--user",
++			strconv.FormatUint(uint64(target.UserID), 10), target.PackageName,
++		)
++		if output, err := command.CombinedOutput(); err != nil {
++			return result, fmt.Errorf("force-stop %s: %w: %s", target.PackageName, err, strings.TrimSpace(string(output)))
++		}
++		result.StoppedPackages++
++	}
++	verify := uniqueUIDs(verifyUIDs)
++	for {
++		remaining, err := activeUIDs(verify)
++		if err != nil {
++			return result, err
++		}
++		result.RemainingUIDs = remaining
++		result.VerifiedUIDs = len(verify) - len(remaining)
++		if len(remaining) == 0 {
++			return result, nil
++		}
++		select {
++		case <-ctx.Done():
++			return result, fmt.Errorf("affected application processes remained active")
++		case <-time.After(100 * time.Millisecond):
++		}
++	}
++}
++
++func validUIDPolicyResetTarget(target uidPolicyResetTarget) bool {
++	if target.UID < 10_000 || target.UID%androidUserUIDRange > 19_999 ||
++		target.UserID != target.UID/androidUserUIDRange {
++		return false
++	}
++	parts := strings.Split(target.PackageName, ".")
++	if len(parts) < 2 {
++		return false
++	}
++	for _, part := range parts {
++		if part == "" || !isPackageIdentifierStart(part[0]) {
++			return false
++		}
++		for _, character := range part[1:] {
++			if !isPackageIdentifierPart(character) {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func isPackageIdentifierStart(value byte) bool {
++	return value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
++}
++
++func isPackageIdentifierPart(value rune) bool {
++	return isPackageIdentifierStart(byte(value)) || value >= '0' && value <= '9' || value == '_'
++}
++
++func uniqueUIDs(values []uint32) []uint32 {
++	unique := make(map[uint32]struct{}, len(values))
++	for _, value := range values {
++		if value >= 10_000 {
++			unique[value] = struct{}{}
++		}
++	}
++	result := make([]uint32, 0, len(unique))
++	for value := range unique {
++		result = append(result, value)
++	}
++	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
++	return result
++}
++
++func activeUIDs(uids []uint32) ([]uint32, error) {
++	if len(uids) == 0 {
++		return nil, nil
++	}
++	requested := make(map[uint32]struct{}, len(uids))
++	for _, uid := range uids {
++		requested[uid] = struct{}{}
++	}
++	entries, err := os.ReadDir("/proc")
++	if err != nil {
++		return nil, err
++	}
++	active := make(map[uint32]struct{})
++	for _, entry := range entries {
++		if !entry.IsDir() {
++			continue
++		}
++		if _, err = strconv.ParseUint(entry.Name(), 10, 32); err != nil {
++			continue
++		}
++		status, readErr := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
++		if readErr != nil {
++			continue
++		}
++		for _, line := range strings.Split(string(status), "\n") {
++			if !strings.HasPrefix(line, "Uid:") {
++				continue
++			}
++			fields := strings.Fields(line)
++			if len(fields) < 2 {
++				break
++			}
++			uid, parseErr := strconv.ParseUint(fields[1], 10, 32)
++			if parseErr == nil {
++				if _, found := requested[uint32(uid)]; found {
++					active[uint32(uid)] = struct{}{}
++				}
++			}
++			break
++		}
++	}
++	remaining := make([]uint32, 0, len(active))
++	for uid := range active {
++		remaining = append(remaining, uid)
++	}
++	sort.Slice(remaining, func(i, j int) bool { return remaining[i] < remaining[j] })
++	return remaining, nil
+ }

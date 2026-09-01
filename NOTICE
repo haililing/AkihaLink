@@ -1,0 +1,16 @@
+AkihaLink
+Copyright (C) 2026 AkihaLink contributors
+
+This distribution includes and builds sing-box from:
+https://github.com/CHIZI-0618/sing-box
+Pinned revision: 90bb3d43634b56b38834a239f3129d3009ece9d4
+Base patch set: akihalink-upstream-clean-v1
+Generic overlay patch set: akihalink-upstream-ebpf-v16
+Patch locks: patches/sing-box/patches.lock.json and patches/sing-box/generic-patches.lock.json
+
+The sing-box eBPF implementation incorporates GPL-3.0 code derived from:
+https://github.com/Asterisk4Magisk/bpf2socks
+
+Subscription parsing behavior is informed by the GPL-3.0 NekoBox for Android
+project. AkihaLink's implementation is maintained as isolated source in this
+repository and retains compatible GPL-3.0 licensing.

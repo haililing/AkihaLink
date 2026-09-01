@@ -1,0 +1,2 @@
+Ldev/akiha/akihalink/AkihaLinkApplication;
+Ldev/akiha/akihalink/MainActivity;

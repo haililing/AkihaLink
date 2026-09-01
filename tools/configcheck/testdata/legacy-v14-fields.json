@@ -1,0 +1,16 @@
+{
+  "inbounds": [
+    {
+      "type": "ebpf",
+      "tag": "ebpf-in",
+      "network": ["tcp", "udp"],
+      "dns_mode": "hijack",
+      "redirect_address": ["127.128.0.0/9", "fd53:696e:672d:626f::/64"],
+      "cgroup_enabled": true,
+      "exclude_uid": [10123],
+      "shared_network": {"enabled": false}
+    }
+  ],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"final": "direct"}
+}

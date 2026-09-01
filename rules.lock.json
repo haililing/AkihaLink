@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 2,
+  "sources": [
+    {
+      "repository": "https://github.com/SagerNet/sing-geosite.git",
+      "commit": "026bbbc872cfd292a876e05d68ad4824f2d6746d",
+      "files": [
+        {
+          "name": "geosite-geolocation-cn.srs",
+          "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/026bbbc872cfd292a876e05d68ad4824f2d6746d/geosite-geolocation-cn.srs",
+          "sha256": "33936830c3272bd0cd8ddf765b5a7d6aa7bb90a2b29dbd0ac5e6c3b1b467048f"
+        },
+        {
+          "name": "geosite-geolocation-!cn.srs",
+          "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/026bbbc872cfd292a876e05d68ad4824f2d6746d/geosite-geolocation-!cn.srs",
+          "sha256": "1d8f12fb08c6a83f87b6488080d6d3c7c56db4ab1b84f5777ae5ef2c7bc5e603"
+        }
+      ]
+    },
+    {
+      "repository": "https://github.com/SagerNet/sing-geoip.git",
+      "commit": "5605651c12ed5b2fcf3b5de580c041eb9d8d938e",
+      "files": [
+        {
+          "name": "geoip-cn.srs",
+          "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/5605651c12ed5b2fcf3b5de580c041eb9d8d938e/geoip-cn.srs",
+          "sha256": "bc1a9eb66f9c6a0fe9fc5300cf5b5e885e0f9eadd7213b085b767a95d6af3d2a"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+<resources>
+    <string name="app_name">AkihaLink</string>
+
+    <string name="nav_overview">概览</string>
+    <string name="nav_home_a11y">首页</string>
+    <string name="nav_nodes">节点</string>
+    <string name="nav_manage">管理</string>
+
+    <string name="environment_not_ready">运行环境未就绪</string>
+    <string name="search_clear">清空搜索</string>
+
+    <string name="apps_empty">没有可管理的应用</string>
+    <string name="apps_loading">正在读取应用</string>
+    <string name="apps_empty_supporting">系统没有返回可用的应用列表。</string>
+    <string name="apps_filter_all">全部</string>
+    <string name="apps_filter_user">用户应用</string>
+    <string name="apps_filter_system">系统应用</string>
+    <string name="apps_no_match">没有匹配的应用</string>
+    <string name="apps_no_match_supporting">换个关键词或筛选条件。</string>
+    <string name="apps_search_hint">搜索名称或包名</string>
+    <string name="apps_discard_title">放弃更改？</string>
+    <string name="apps_discard_message">%1$d 项修改尚未应用，离开后将恢复原设置。</string>
+    <string name="action_discard">放弃</string>
+    <string name="action_continue_editing">继续编辑</string>
+    <string name="apps_excluded_count">%1$d 个应用直连</string>
+    <string name="apps_pending_count">%1$d 项待应用</string>
+    <string name="action_apply">应用</string>
+</resources>

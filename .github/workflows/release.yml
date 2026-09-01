@@ -1,0 +1,455 @@
+name: AkihaLink trusted release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (for example, 1.1)
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CORE_COMMIT: 90bb3d43634b56b38834a239f3129d3009ece9d4
+  CORE_PATCH_SET: akihalink-upstream-ebpf-v15
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      release-image: ${{ steps.image.outputs.value }}
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Checkout version sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Resolve and validate the release version
+        id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            version="${GITHUB_REF_NAME#v}"
+            test "$GITHUB_REF_NAME" = "v${version}"
+          else
+            version="$REQUESTED_VERSION"
+          fi
+          printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
+          app_version="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n1)"
+          module_version="$(sed -n 's/^version=//p' module/module.prop | head -n1)"
+          app_version_code="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -n1)"
+          module_version_code="$(sed -n 's/^versionCode=//p' module/module.prop | head -n1)"
+          app_protocol="$(sed -n 's/.*CONTROL_PROTOCOL_VERSION\", \"\([0-9]*\)\".*/\1/p' app/build.gradle.kts | head -n1)"
+          module_protocol="$(sed -n 's/^PROTOCOL=//p' module/bin/akihalinkctl | head -n1)"
+          package_default="$(sed -n 's/.*\[string\]\$Version = "\([^"]*\)".*/\1/p' scripts/build-release-candidate.ps1 | head -n1)"
+          test "$version" = "$app_version"
+          test "$version" = "$module_version"
+          test "$version" = "$package_default"
+          test -n "$app_version_code" && test "$app_version_code" = "$module_version_code"
+          test -n "$app_protocol" && test "$app_protocol" = "$module_protocol"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require an immutable release image
+        id: image
+        env:
+          RELEASE_IMAGE: ${{ vars.AKIHALINK_RELEASE_IMAGE }}
+        run: |
+          if ! printf '%s' "$RELEASE_IMAGE" |
+            grep -Eq '^ghcr\.io/[A-Za-z0-9_.-]+/akihalink-release-toolchain@sha256:[0-9a-f]{64}$'; then
+            echo "AKIHALINK_RELEASE_IMAGE must be a GHCR image pinned by sha256 digest" >&2
+            exit 1
+          fi
+          echo "value=$RELEASE_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Require physical-device acceptance
+        shell: bash
+        env:
+          DEVICE_MATRIX_ATTESTATION: ${{ vars.AKIHALINK_DEVICE_MATRIX_ATTESTATION }}
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          expected="${CORE_COMMIT}:${CORE_PATCH_SET}:${RELEASE_VERSION}"
+          if [ "$DEVICE_MATRIX_ATTESTATION" != "$expected" ]; then
+            echo "AKIHALINK_DEVICE_MATRIX_ATTESTATION must equal $expected" >&2
+            exit 1
+          fi
+
+  draft-release:
+    if: github.event_name == 'push'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create the unpublished release first
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: v${{ needs.preflight.outputs.version }}
+          name: AkihaLink ${{ needs.preflight.outputs.version }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+
+  verifier:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout pinned sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: recursive
+
+      - name: Set up Go 1.26.6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.6
+          cache: false
+
+      - name: Install Android NDK r29
+        shell: bash
+        run: |
+          sdkmanager="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdkmanager"
+          set +e
+          yes | "$sdkmanager" --install "ndk;29.0.14206865"
+          sdkmanager_status=${PIPESTATUS[1]}
+          set -e
+          test "$sdkmanager_status" -eq 0
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - name: Build the pinned Android arm64 core and BPF objects
+        shell: pwsh
+        run: >-
+          ./scripts/build-core.ps1
+          -Ndk $env:ANDROID_NDK_HOME
+          -Output "$PWD/build/verifier/sing-box-android-arm64"
+
+      - name: Load and attach eBPF programs on the runner kernel
+        shell: bash
+        working-directory: build/core-source
+        run: |
+          test_binary="$RUNNER_TEMP/akihalink-ebpf-verifier"
+          shared_test_binary="$RUNNER_TEMP/akihalink-ebpf-shared-verifier"
+          cgroup="/sys/fs/cgroup/akihalink-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          go test -c -tags with_ebpf,ebpf_integration \
+            -o "$test_binary" ./common/ebpf
+          go test -c -tags with_ebpf,ebpf_integration \
+            -o "$shared_test_binary" ./protocol/ebpf
+          sudo mkdir "$cgroup"
+          cleanup() {
+            sudo rmdir "$cgroup"
+            rm -f "$test_binary" "$shared_test_binary"
+          }
+          trap cleanup EXIT
+          sudo env \
+            SING_BOX_EBPF_INTEGRATION=1 \
+            SING_BOX_EBPF_INTEGRATION_ATTACH=1 \
+            SING_BOX_EBPF_INTEGRATION_CGROUP="$cgroup" \
+            "$test_binary" -test.v \
+            -test.run '^Test(CgroupBackendProgramLoad|CgroupBackendTraffic|SharedNetwork(SharedMap|Standalone)ProgramLoad|MapBatch|UIDPolicyMapTransaction|UIDPolicyMapCapacityFailureRollsBack)Integration$'
+          sudo env \
+            SING_BOX_EBPF_SHARED_INTEGRATION=1 \
+            "$shared_test_binary" -test.v \
+            -test.run '^TestSharedNetworkDataPathIntegration$'
+
+  build:
+    needs: [preflight, draft-release, verifier]
+    if: always() && needs.preflight.result == 'success' && needs.verifier.result == 'success' && (needs.draft-release.result == 'success' || needs.draft-release.result == 'skipped')
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ needs.preflight.outputs.release-image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      AKIHALINK_STORE_PASSWORD: ${{ secrets.AKIHALINK_STORE_PASSWORD }}
+      AKIHALINK_KEY_ALIAS: ${{ secrets.AKIHALINK_KEY_ALIAS }}
+      AKIHALINK_KEY_PASSWORD: ${{ secrets.AKIHALINK_KEY_PASSWORD }}
+    steps:
+      - name: Checkout pinned sources
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Fix and verify the release environment
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git -C third_party/sing-box rev-parse HEAD)" = "$CORE_COMMIT"
+          test "$(java -version 2>&1 | head -n1 | grep -o '21[^\" ]*')" != ""
+          test "$(go env GOVERSION)" = "go1.26.6"
+          test -x "$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          test -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          echo "SOURCE_DATE_EPOCH=$epoch" >> "$GITHUB_ENV"
+          echo "TZ=UTC" >> "$GITHUB_ENV"
+          echo "LANG=C.UTF-8" >> "$GITHUB_ENV"
+
+      - name: Static module and controller regression
+        shell: pwsh
+        run: ./scripts/test-module.ps1 -Core "$PWD/build/not-built"
+
+      - name: JVM tests and benchmark source compilation
+        shell: bash
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-tests
+        run: |
+          ./gradlew --no-daemon \
+            -Pakihalink.fixtureDir="$PWD/build/config-fixtures" \
+            testDebugUnitTest \
+            :baselineprofile:assemble
+
+      - name: Validate generated configurations against pinned sing-box
+        shell: bash
+        working-directory: tools/configcheck
+        run: |
+          tags=with_quic,with_utls,with_clash_api,with_ebpf,with_akihalink_minimal_registry
+          go run -mod=readonly -tags "$tags" . \
+            ../../build/config-fixtures/global.json \
+            ../../build/config-fixtures/rule.json \
+            ../../build/config-fixtures/hybrid.json \
+            ../../build/config-fixtures/all-protocols.json \
+            ../../build/config-fixtures/speedtest.json
+          if go run -mod=readonly -tags "$tags" . testdata/legacy-v14-fields.json; then
+            echo "Pinned config checker accepted removed v14 eBPF fields" >&2
+            exit 1
+          fi
+
+      - name: Build reproducible candidate A
+        shell: pwsh
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-a
+          GOCACHE: ${{ runner.temp }}/go-build-a
+          GOMODCACHE: ${{ runner.temp }}/go-mod-a
+        run: >-
+          ./scripts/build-release-candidate.ps1
+          -Output "$PWD/build/repro/a"
+          -Ndk $env:ANDROID_NDK_HOME
+          -Version $env:VERSION
+          -SourceDateEpoch $env:SOURCE_DATE_EPOCH
+
+      - name: Verify CO-RE object and observability tests
+        shell: bash
+        working-directory: build/core-source
+        run: |
+          readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$readelf" -S experimental/akihalinkobs/akihalink_bpfel.o | grep -q '\.BTF'
+          "$readelf" -S experimental/akihalinkobs/akihalink_bpfel.o | grep -q '\.BTF.ext'
+          go test -count=1 -tags with_ebpf,with_akihalink_observability \
+            ./common/dialer ./common/ebpf ./protocol/ebpf ./experimental/akihalinkobs
+          go test -race -count=1 -tags with_ebpf,with_akihalink_observability \
+            ./common/dialer ./common/ebpf ./protocol/ebpf ./experimental/akihalinkobs
+          CGO_ENABLED=0 GOOS=linux go test -run '^$' \
+            -tags with_ebpf,with_akihalink_observability \
+            ./common/dialer ./common/ebpf ./protocol/ebpf ./experimental/akihalinkobs
+
+      - name: Create independent source tree B
+        id: source-b
+        shell: bash
+        run: |
+          destination="$RUNNER_TEMP/akihalink-repro-b"
+          git clone --quiet --no-hardlinks "$GITHUB_WORKSPACE" "$destination"
+          git -C "$destination" checkout --quiet --detach "$GITHUB_SHA"
+          git -C "$destination" submodule update --init --recursive
+          git -C "$destination" config --global --add safe.directory "$destination"
+          echo "path=$destination" >> "$GITHUB_OUTPUT"
+
+      - name: Build reproducible candidate B
+        shell: pwsh
+        working-directory: ${{ steps.source-b.outputs.path }}
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle-b
+          GOCACHE: ${{ runner.temp }}/go-build-b
+          GOMODCACHE: ${{ runner.temp }}/go-mod-b
+        run: >-
+          ./scripts/build-release-candidate.ps1
+          -Output "$PWD/build/repro/b"
+          -Ndk $env:ANDROID_NDK_HOME
+          -Version $env:VERSION
+          -SourceDateEpoch $env:SOURCE_DATE_EPOCH
+
+      - name: Compare all reproducible outputs byte for byte
+        shell: pwsh
+        env:
+          SOURCE_B: ${{ steps.source-b.outputs.path }}
+          RELEASE_IMAGE: ${{ needs.preflight.outputs.release-image }}
+        run: |
+          $names = @(
+            "AkihaLink-$env:VERSION-unsigned.apk",
+            "sing-box-$env:VERSION-android-arm64",
+            "AkihaLink-KSU-$env:VERSION.zip",
+            "AkihaLink-$env:VERSION-source.tar.gz"
+          )
+          ./scripts/compare-reproducible.ps1 `
+            -First "$PWD/build/repro/a" `
+            -Second "$env:SOURCE_B/build/repro/b" `
+            -Names $names `
+            -Output "$PWD/build/release"
+          ./scripts/write-reproducibility.ps1 `
+            -Directory "$PWD/build/release" `
+            -Names $names `
+            -SourceDateEpoch $env:SOURCE_DATE_EPOCH `
+            -ToolchainImage $env:RELEASE_IMAGE
+
+      - name: Confirm embedded profile artifacts
+        shell: bash
+        run: |
+          test -s \
+            app/build/intermediates/merged_startup_profile/release/mergeReleaseStartupProfile/startup-prof.txt
+          unzip -l "build/release/AkihaLink-${VERSION}-unsigned.apk" |
+            grep -q 'assets/dexopt/baseline.prof'
+          unzip -l "build/release/AkihaLink-${VERSION}-unsigned.apk" |
+            grep -q 'assets/dexopt/baseline.profm'
+          if unzip -p "build/release/AkihaLink-${VERSION}-unsigned.apk" classes.dex |
+            grep -aEq 'BenchmarkBootstrap|Benchmark Node|BENCHMARK_SEED'; then
+            echo "Benchmark fixture leaked into the release APK" >&2
+            exit 1
+          fi
+
+      - name: Decode and validate signing material
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.AKIHALINK_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64"
+          test -n "$AKIHALINK_STORE_PASSWORD"
+          test -n "$AKIHALINK_KEY_ALIAS"
+          test -n "$AKIHALINK_KEY_PASSWORD"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/akihalink.jks"
+          expected="$(tr -d '[:space:]:' < release/signing-certificate.sha256 | tr 'A-F' 'a-f')"
+          test "$(printf '%s' "$expected" | wc -c)" -eq 64
+          echo "AKIHALINK_KEYSTORE=$RUNNER_TEMP/akihalink.jks" >> "$GITHUB_ENV"
+          echo "EXPECTED_CERT_SHA256=$expected" >> "$GITHUB_ENV"
+
+      - name: Align, sign, and verify the installable APK
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          build_tools="$ANDROID_HOME/build-tools/36.0.0"
+          unsigned="build/release/AkihaLink-${VERSION}-unsigned.apk"
+          aligned="$RUNNER_TEMP/AkihaLink-${VERSION}-aligned.apk"
+          signed="build/release/AkihaLink-${VERSION}.apk"
+          "$build_tools/zipalign" -f -p 4 "$unsigned" "$aligned"
+          "$build_tools/apksigner" sign \
+            --ks "$AKIHALINK_KEYSTORE" \
+            --ks-key-alias "$AKIHALINK_KEY_ALIAS" \
+            --ks-pass env:AKIHALINK_STORE_PASSWORD \
+            --key-pass env:AKIHALINK_KEY_PASSWORD \
+            --out "$signed" "$aligned"
+          "$build_tools/apksigner" verify --verbose --print-certs "$signed" |
+            tee "$RUNNER_TEMP/apksigner.txt"
+          actual="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apksigner.txt" |
+            tr -d ':' | tr 'A-F' 'a-f' | head -n1)"
+          test "$actual" = "$EXPECTED_CERT_SHA256"
+
+      - name: Write final checksums
+        shell: pwsh
+        run: ./scripts/write-checksums.ps1 -Directory "$PWD/build/release"
+
+      - name: Install fixed Cosign
+        if: github.event_name == 'push'
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+        with:
+          cosign-release: v3.0.2
+
+      - name: Sign and verify SHA256SUMS with GitHub OIDC
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          bundle="build/release/SHA256SUMS.sigstore.json"
+          cosign sign-blob --yes --bundle "$bundle" build/release/SHA256SUMS
+          cosign verify-blob \
+            --bundle "$bundle" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/v${VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            build/release/SHA256SUMS
+
+      - name: Generate SLSA build provenance
+        if: github.event_name == 'push'
+        id: provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        with:
+          subject-path: |
+            build/release/AkihaLink-${{ needs.preflight.outputs.version }}.apk
+            build/release/AkihaLink-${{ needs.preflight.outputs.version }}-unsigned.apk
+            build/release/AkihaLink-KSU-${{ needs.preflight.outputs.version }}.zip
+            build/release/sing-box-${{ needs.preflight.outputs.version }}-android-arm64
+            build/release/AkihaLink-${{ needs.preflight.outputs.version }}-source.tar.gz
+
+      - name: Add the provenance Sigstore bundle
+        if: github.event_name == 'push'
+        shell: bash
+        run: cp '${{ steps.provenance.outputs.bundle-path }}' "build/release/AkihaLink-${VERSION}-provenance.sigstore.json"
+
+      - name: Upload candidate bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: AkihaLink-${{ env.VERSION }}-${{ github.run_id }}
+          path: build/release/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Download verified release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: AkihaLink-${{ env.VERSION }}-${{ github.run_id }}
+          path: release
+
+      - name: Attach artifacts to the existing draft
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: v${{ needs.preflight.outputs.version }}
+          draft: true
+          files: |
+            release/AkihaLink-${{ needs.preflight.outputs.version }}.apk
+            release/AkihaLink-${{ needs.preflight.outputs.version }}-unsigned.apk
+            release/AkihaLink-KSU-${{ needs.preflight.outputs.version }}.zip
+            release/sing-box-${{ needs.preflight.outputs.version }}-android-arm64
+            release/AkihaLink-${{ needs.preflight.outputs.version }}-source.tar.gz
+            release/SHA256SUMS
+            release/reproducibility.json
+            release/SHA256SUMS.sigstore.json
+            release/AkihaLink-${{ needs.preflight.outputs.version }}-provenance.sigstore.json
+
+      - name: Verify attachment completeness and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          expected=(
+            AkihaLink-${VERSION}.apk
+            AkihaLink-${VERSION}-unsigned.apk
+            AkihaLink-KSU-${VERSION}.zip
+            sing-box-${VERSION}-android-arm64
+            AkihaLink-${VERSION}-source.tar.gz
+            SHA256SUMS
+            reproducibility.json
+            SHA256SUMS.sigstore.json
+            AkihaLink-${VERSION}-provenance.sigstore.json
+          )
+          assets="$(gh release view "v${VERSION}" --json assets --jq '.assets[].name')"
+          for name in "${expected[@]}"; do
+            grep -Fxq "$name" <<<"$assets"
+          done
+          gh release edit "v${VERSION}" --draft=false --prerelease=false

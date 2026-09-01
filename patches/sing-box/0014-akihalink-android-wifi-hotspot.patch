@@ -1,0 +1,1012 @@
+diff --git a/common/ebpf/cgroup_backend_cgo.go b/common/ebpf/cgroup_backend_cgo.go
+index a025c3c2..ece6a616 100644
+--- a/common/ebpf/cgroup_backend_cgo.go
++++ b/common/ebpf/cgroup_backend_cgo.go
+@@ -135,29 +135,29 @@ import (
+ var cgroupObject []byte
+ 
+ type CgroupBackend struct {
+-	access                sync.RWMutex
+-	health                backendHealth
+-	tcpSweepAccess        sync.Mutex
+-	tcpSweepScratch       mapScanScratch[listenerLookupKey, originalDestinationValue]
+-	tcpSweepCandidates    []tcpRedirectEntry
+-	tcpRedirectUsage      atomic.Uint32
+-	tcpRedirectUsageKnown atomic.Bool
+-	lookupAndDeleteMode   atomic.Int32
+-	runtime               *C.struct_sb_ebpf_cgroup_runtime
+-	statsMapFD            int
+-	mapCapacity           CgroupMapCapacity
+-	tcpRedirectMapFD      int
+-	udpRedirectMapFD      int
+-	udpFlowMapFD          int
+-	socketBypassMapFD     int
+-	pendingSocketCookies  map[uint64]struct{}
+-	bypassIPv4CIDRMapFD   int
+-	bypassIPv6CIDRMapFD   int
+-	ipv6AvailableMapFD    int
+-	uidPolicyMapFD        int
+-	uidPolicyEntries      []uidLPMKey
+-	uidPolicy             CgroupPolicy
+-	uidDefaultBypass      bool
++	access                       sync.RWMutex
++	health                       backendHealth
++	tcpSweepAccess               sync.Mutex
++	tcpSweepScratch              mapScanScratch[listenerLookupKey, originalDestinationValue]
++	tcpSweepCandidates           []tcpRedirectEntry
++	tcpRedirectUsage             atomic.Uint32
++	tcpRedirectUsageKnown        atomic.Bool
++	lookupAndDeleteMode          atomic.Int32
++	runtime                      *C.struct_sb_ebpf_cgroup_runtime
++	statsMapFD                   int
++	mapCapacity                  CgroupMapCapacity
++	tcpRedirectMapFD             int
++	udpRedirectMapFD             int
++	udpFlowMapFD                 int
++	socketBypassMapFD            int
++	pendingSocketCookies         map[uint64]struct{}
++	bypassIPv4CIDRMapFD          int
++	bypassIPv6CIDRMapFD          int
++	ipv6AvailableMapFD           int
++	uidPolicyMapFD               int
++	uidPolicyEntries             []uidLPMKey
++	uidPolicy                    CgroupPolicy
++	uidDefaultBypass             bool
+ 	uidBypassCounterMapFD        int
+ 	uidTrackedUIDs               []uint32
+ 	systemResolverTGIDMapFD      int
+@@ -166,19 +166,19 @@ type CgroupBackend struct {
+ 	systemResolverMonitorMu      sync.Mutex
+ 	systemResolverStop           chan struct{}
+ 	systemResolverDone           chan struct{}
+-	bypassIPv4CIDR        []netip.Prefix
+-	bypassIPv6CIDR        []netip.Prefix
+-	cgroupPath            string
+-	redirectIPv4          netip.Prefix
+-	redirectIPv6          netip.Prefix
+-	enableIPv6            bool
+-	autoIPv6              bool
+-	ipv6Available         bool
+-	enableUDP             bool
+-	hijackDNS             bool
+-	bypassPrivateAddress  bool
+-	dnsRespectBypass      bool
+-	udpTimeoutSeconds     uint32
++	bypassIPv4CIDR               []netip.Prefix
++	bypassIPv6CIDR               []netip.Prefix
++	cgroupPath                   string
++	redirectIPv4                 netip.Prefix
++	redirectIPv6                 netip.Prefix
++	enableIPv6                   bool
++	autoIPv6                     bool
++	ipv6Available                bool
++	enableUDP                    bool
++	hijackDNS                    bool
++	bypassPrivateAddress         bool
++	dnsRespectBypass             bool
++	udpTimeoutSeconds            uint32
+ }
+ 
+ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+diff --git a/option/ebpf.go b/option/ebpf.go
+index 1e91e9ec..3c4338fe 100644
+--- a/option/ebpf.go
++++ b/option/ebpf.go
+@@ -36,6 +36,7 @@ type EBPFMapCapacityOptions struct {
+ 
+ type EBPFSharedNetworkOptions struct {
+ 	Enabled           bool                                `json:"enabled,omitempty"`
++	AndroidTethering  string                              `json:"android_tethering,omitempty" enum:"wifi"`
+ 	IncludeInterface  badoption.Listable[string]          `json:"include_interface,omitempty"`
+ 	IncludeSourceCIDR badoption.Listable[netip.Prefix]    `json:"include_source_cidr,omitempty"`
+ 	ExcludeSourceCIDR badoption.Listable[netip.Prefix]    `json:"exclude_source_cidr,omitempty"`
+diff --git a/protocol/ebpf/android_tethering.go b/protocol/ebpf/android_tethering.go
+new file mode 100644
+index 00000000..7d8544ae
+--- /dev/null
++++ b/protocol/ebpf/android_tethering.go
+@@ -0,0 +1,163 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"time"
++)
++
++const (
++	androidTetheringWiFi          = "wifi"
++	androidTetheringReadTimeout   = 2 * time.Second
++	androidTetheringOutputLimit   = 64 << 10
++	androidTetheringFailureLimit  = 3
++	androidTetheringRefreshPeriod = 30 * time.Second
++)
++
++var (
++	wifiRegexLine             = regexp.MustCompile(`(?i)(?:m?TetherableWifiRegexs)\s*[:=]\s*\[(.*)\]`)
++	tetheredInterfacePatterns = []*regexp.Regexp{
++		regexp.MustCompile(`^\s*([A-Za-z0-9_.-]{1,15})\s*-\s*TetheredState(?:\s*-|\s*$)`),
++		regexp.MustCompile(`^\s*([A-Za-z0-9_.-]{1,15})\s*[:=]\s*TetheredState\s*$`),
++		regexp.MustCompile(`(?i)(?:iface|interface)\s*[=:]\s*([A-Za-z0-9_.-]{1,15}).*(?:state|currentState)\s*[=:]\s*TetheredState`),
++	}
++	validSharedInterfaceName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,15}$`)
++)
++
++type cappedOutput struct {
++	buffer   bytes.Buffer
++	overflow bool
++}
++
++func (w *cappedOutput) Write(p []byte) (int, error) {
++	remaining := androidTetheringOutputLimit - w.buffer.Len()
++	if remaining > 0 {
++		if len(p) < remaining {
++			remaining = len(p)
++		}
++		_, _ = w.buffer.Write(p[:remaining])
++	}
++	if len(p) > remaining {
++		w.overflow = true
++	}
++	return len(p), nil
++}
++
++type androidTetheringDiscoveryError struct{ cause error }
++
++func (e *androidTetheringDiscoveryError) Error() string { return e.cause.Error() }
++func (e *androidTetheringDiscoveryError) Unwrap() error { return e.cause }
++
++func discoverAndroidWiFiTethering(parent context.Context) ([]string, error) {
++	ctx, cancel := context.WithTimeout(parent, androidTetheringReadTimeout)
++	defer cancel()
++	output := new(cappedOutput)
++	command := exec.CommandContext(ctx, "/system/bin/dumpsys", "tethering")
++	command.Stdout = output
++	if err := command.Run(); err != nil {
++		if ctx.Err() != nil {
++			err = ctx.Err()
++		}
++		return nil, &androidTetheringDiscoveryError{fmt.Errorf("read Android tethering state: %w", err)}
++	}
++	if output.overflow {
++		return nil, &androidTetheringDiscoveryError{fmt.Errorf("Android tethering state exceeded %d bytes", androidTetheringOutputLimit)}
++	}
++	interfaces, err := parseAndroidWiFiTetheringState(output.buffer.String())
++	if err != nil {
++		return nil, &androidTetheringDiscoveryError{err}
++	}
++	return interfaces, nil
++}
++
++func parseAndroidWiFiTetheringState(output string) ([]string, error) {
++	var wifiPatterns []*regexp.Regexp
++	var tethered []string
++	scanner := bufio.NewScanner(strings.NewReader(output))
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if match := wifiRegexLine.FindStringSubmatch(line); len(match) == 2 {
++			for _, rawPattern := range strings.Split(match[1], ",") {
++				rawPattern = strings.Trim(strings.TrimSpace(rawPattern), `"'`)
++				if rawPattern == "" {
++					continue
++				}
++				pattern, err := regexp.Compile("^(?:" + rawPattern + ")$")
++				if err != nil {
++					return nil, fmt.Errorf("parse Android Wi-Fi tethering regex: %w", err)
++				}
++				wifiPatterns = append(wifiPatterns, pattern)
++			}
++		}
++		if !strings.Contains(line, "TetheredState") || strings.Contains(strings.ToLower(line), "localonly") {
++			continue
++		}
++		for _, pattern := range tetheredInterfacePatterns {
++			if match := pattern.FindStringSubmatch(line); len(match) == 2 {
++				tethered = append(tethered, match[1])
++				break
++			}
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		return nil, fmt.Errorf("scan Android tethering state: %w", err)
++	}
++	if len(wifiPatterns) == 0 {
++		return nil, fmt.Errorf("Android tethering state did not provide Wi-Fi interface regexes")
++	}
++	selected := make(map[string]struct{})
++	for _, interfaceName := range tethered {
++		if !validSharedInterfaceName.MatchString(interfaceName) {
++			continue
++		}
++		for _, pattern := range wifiPatterns {
++			if pattern.MatchString(interfaceName) {
++				selected[interfaceName] = struct{}{}
++				break
++			}
++		}
++	}
++	interfaces := make([]string, 0, len(selected))
++	for interfaceName := range selected {
++		interfaces = append(interfaces, interfaceName)
++	}
++	sort.Strings(interfaces)
++	return interfaces, nil
++}
++
++func writeAndroidHotspotState(state string) error {
++	runtimeDirectory := os.Getenv("AKIHALINK_RUNTIME")
++	if runtimeDirectory == "" {
++		return nil
++	}
++	if err := os.MkdirAll(runtimeDirectory, 0o700); err != nil {
++		return err
++	}
++	temporary, err := os.CreateTemp(runtimeDirectory, ".hotspot-state-")
++	if err != nil {
++		return err
++	}
++	temporaryName := temporary.Name()
++	defer os.Remove(temporaryName)
++	if err = temporary.Chmod(0o600); err == nil {
++		_, err = temporary.WriteString(state + "\n")
++	}
++	closeErr := temporary.Close()
++	if err == nil {
++		err = closeErr
++	}
++	if err != nil {
++		return err
++	}
++	return os.Rename(temporaryName, filepath.Join(runtimeDirectory, "hotspot.state"))
++}
+diff --git a/protocol/ebpf/android_tethering_test.go b/protocol/ebpf/android_tethering_test.go
+new file mode 100644
+index 00000000..9e0f2e82
+--- /dev/null
++++ b/protocol/ebpf/android_tethering_test.go
+@@ -0,0 +1,90 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import (
++	"reflect"
++	"testing"
++
++	"github.com/sagernet/sing-box/option"
++)
++
++func TestNormalizeAndroidWiFiTethering(t *testing.T) {
++	options, err := normalizeSharedNetworkOptionsForPlatform("android", option.EBPFSharedNetworkOptions{
++		Enabled:          true,
++		AndroidTethering: androidTetheringWiFi,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if options.AndroidTethering != androidTetheringWiFi || len(options.IncludeInterface) != 0 {
++		t.Fatalf("unexpected normalized options: %+v", options)
++	}
++	for name, testOptions := range map[string]option.EBPFSharedNetworkOptions{
++		"non_android": {Enabled: true, AndroidTethering: androidTetheringWiFi},
++		"mixed_selection": {
++			Enabled: true, AndroidTethering: androidTetheringWiFi, IncludeInterface: []string{"ap0"},
++		},
++	} {
++		platform := "android"
++		if name == "non_android" {
++			platform = "linux"
++		}
++		if _, err = normalizeSharedNetworkOptionsForPlatform(platform, testOptions); err == nil {
++			t.Fatalf("expected %s to be rejected", name)
++		}
++	}
++}
++
++func TestParseAndroidWiFiTetheringStateAOSP(t *testing.T) {
++	output := `
++Tethering:
++  Configuration:
++    tetherableWifiRegexs: [wlan\d+, ap\d+]
++  Tether state:
++    wlan0 - AvailableState - lastError = 0
++    wlan1 - TetheredState - lastError = 0
++    rndis0 - TetheredState - lastError = 0
++`
++	interfaces, err := parseAndroidWiFiTetheringState(output)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(interfaces, []string{"wlan1"}) {
++		t.Fatalf("unexpected interfaces: %v", interfaces)
++	}
++}
++
++func TestParseAndroidWiFiTetheringStateVendorFormats(t *testing.T) {
++	output := `
++ mTetherableWifiRegexs=[softap[0-9]+, wlan[0-9]+]
++ InterfaceStateMachine{iface=softap2, currentState=TetheredState}
++ InterfaceStateMachine{iface=wlan0, currentState=AvailableState}
++ wlan1: TetheredState
++ p2p0 - TetheredState - lastError = 0
++`
++	interfaces, err := parseAndroidWiFiTetheringState(output)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(interfaces, []string{"softap2", "wlan1"}) {
++		t.Fatalf("unexpected interfaces: %v", interfaces)
++	}
++}
++
++func TestParseAndroidWiFiTetheringStateRequiresSystemRegexes(t *testing.T) {
++	if _, err := parseAndroidWiFiTetheringState("wlan1 - TetheredState - lastError = 0"); err == nil {
++		t.Fatal("expected missing Wi-Fi regexes to be rejected")
++	}
++}
++
++func TestCappedAndroidTetheringOutput(t *testing.T) {
++	writer := new(cappedOutput)
++	payload := make([]byte, androidTetheringOutputLimit+1)
++	if count, err := writer.Write(payload); err != nil || count != len(payload) {
++		t.Fatalf("unexpected capped write: count=%d error=%v", count, err)
++	}
++	if !writer.overflow || writer.buffer.Len() != androidTetheringOutputLimit {
++		t.Fatalf("output cap was not enforced: size=%d overflow=%v", writer.buffer.Len(), writer.overflow)
++	}
++}
+diff --git a/protocol/ebpf/config.go b/protocol/ebpf/config.go
+index fd78ad8c..f4dbaebd 100644
+--- a/protocol/ebpf/config.go
++++ b/protocol/ebpf/config.go
+@@ -6,6 +6,7 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"path/filepath"
++	"runtime"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -234,11 +235,32 @@ func parseUIDRanges(uidList []uint32, rangeList []string) ([]ECommon.UIDRange, e
+ 	return uidRanges, nil
+ }
+ 
++func platformExcludedUIDRanges(goos string) []ECommon.UIDRange {
++	if goos != "android" {
++		return nil
++	}
++	return []ECommon.UIDRange{{Start: 1052, End: 1052}}
++}
++
+ func normalizeSharedNetworkOptions(options option.EBPFSharedNetworkOptions) (option.EBPFSharedNetworkOptions, error) {
++	return normalizeSharedNetworkOptionsForPlatform(runtime.GOOS, options)
++}
++
++func normalizeSharedNetworkOptionsForPlatform(goos string, options option.EBPFSharedNetworkOptions) (option.EBPFSharedNetworkOptions, error) {
+ 	if !options.Enabled {
+ 		return option.EBPFSharedNetworkOptions{}, nil
+ 	}
+-	if len(options.IncludeInterface) == 0 {
++	if options.AndroidTethering != "" {
++		if goos != "android" {
++			return option.EBPFSharedNetworkOptions{}, E.New("shared_network.android_tethering is only supported on Android")
++		}
++		if options.AndroidTethering != androidTetheringWiFi {
++			return option.EBPFSharedNetworkOptions{}, E.New("unknown shared_network.android_tethering: ", options.AndroidTethering)
++		}
++		if len(options.IncludeInterface) > 0 {
++			return option.EBPFSharedNetworkOptions{}, E.New("shared_network.android_tethering and include_interface are mutually exclusive")
++		}
++	} else if len(options.IncludeInterface) == 0 {
+ 		return option.EBPFSharedNetworkOptions{}, E.New("shared_network.include_interface must not be empty")
+ 	}
+ 	if options.TCPriority == 0 {
+diff --git a/protocol/ebpf/config_test.go b/protocol/ebpf/config_test.go
+new file mode 100644
+index 00000000..74375799
+--- /dev/null
++++ b/protocol/ebpf/config_test.go
+@@ -0,0 +1,15 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import "testing"
++
++func TestPlatformExcludedUIDRanges(t *testing.T) {
++	androidRanges := platformExcludedUIDRanges("android")
++	if len(androidRanges) != 1 || androidRanges[0].Start != 1052 || androidRanges[0].End != 1052 {
++		t.Fatalf("unexpected Android platform exclusions: %+v", androidRanges)
++	}
++	if ranges := platformExcludedUIDRanges("linux"); len(ranges) != 0 {
++		t.Fatalf("unexpected non-Android platform exclusions: %+v", ranges)
++	}
++}
+diff --git a/protocol/ebpf/inbound.go b/protocol/ebpf/inbound.go
+index 1455099f..dce8802f 100644
+--- a/protocol/ebpf/inbound.go
++++ b/protocol/ebpf/inbound.go
+@@ -131,7 +131,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
+ 	if err != nil {
+ 		return nil, E.Cause(err, "parse exclude_uid_range")
+ 	}
+-	sharedNetworkOptions, err := normalizeSharedNetworkOptions(options.SharedNetwork)
++	excludeUIDRanges = append(excludeUIDRanges, platformExcludedUIDRanges(runtime.GOOS)...)
++	sharedNetworkOptions, err := normalizeSharedNetworkOptionsForPlatform(runtime.GOOS, options.SharedNetwork)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/protocol/ebpf/shared_network.go b/protocol/ebpf/shared_network.go
+index 287e9b8a..5ac41767 100644
+--- a/protocol/ebpf/shared_network.go
++++ b/protocol/ebpf/shared_network.go
+@@ -24,22 +24,23 @@ const (
+ )
+ 
+ type sharedNetwork struct {
+-	inbound         *Inbound
+-	interfaces      []string
+-	sharedBackend   *ECommon.SharedNetworkBackend
+-	tcManager       *sharedTCManager
+-	listeners       internalListenerSet
+-	udpNat          *udpnat.Service
+-	udpClientTable  udpClientTable
+-	udpWarnings     udpWarningLimiters
+-	tcpWarnings     warningLimiter
+-	mapCapacity     ECommon.SharedNetworkMapCapacities
+-	janitorWarnings warningLimiter
+-	janitorCancel   context.CancelFunc
+-	janitorDone     chan struct{}
+-	tcPriority      uint16
+-	lifecycleAccess sync.RWMutex
+-	backendAccess   sync.RWMutex
++	inbound          *Inbound
++	interfaces       []string
++	androidTethering string
++	sharedBackend    *ECommon.SharedNetworkBackend
++	tcManager        *sharedTCManager
++	listeners        internalListenerSet
++	udpNat           *udpnat.Service
++	udpClientTable   udpClientTable
++	udpWarnings      udpWarningLimiters
++	tcpWarnings      warningLimiter
++	mapCapacity      ECommon.SharedNetworkMapCapacities
++	janitorWarnings  warningLimiter
++	janitorCancel    context.CancelFunc
++	janitorDone      chan struct{}
++	tcPriority       uint16
++	lifecycleAccess  sync.RWMutex
++	backendAccess    sync.RWMutex
+ }
+ 
+ func newSharedNetwork(inbound *Inbound, options option.EBPFSharedNetworkOptions) *sharedNetwork {
+@@ -48,10 +49,11 @@ func newSharedNetwork(inbound *Inbound, options option.EBPFSharedNetworkOptions)
+ 		tcPriority = defaultSharedNetworkTCPriority
+ 	}
+ 	shared := &sharedNetwork{
+-		inbound:     inbound,
+-		interfaces:  append([]string(nil), options.IncludeInterface...),
+-		mapCapacity: inbound.sharedNetworkMapCapacity,
+-		tcPriority:  tcPriority,
++		inbound:          inbound,
++		interfaces:       append([]string(nil), options.IncludeInterface...),
++		androidTethering: options.AndroidTethering,
++		mapCapacity:      inbound.sharedNetworkMapCapacity,
++		tcPriority:       tcPriority,
+ 	}
+ 	shared.udpNat = udpnat.New(shared, shared.preparePacketConnection, inbound.udpTimeout, false)
+ 	return shared
+@@ -89,13 +91,14 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
+ 		return E.Errors(err, s.Close())
+ 	}
+ 	s.tcManager = &sharedTCManager{
+-		backend:        backend,
+-		logger:         s.inbound.logger,
+-		interfaces:     s.interfaces,
+-		enableIPv4:     s.inbound.redirectIPv4Prefix.IsValid(),
+-		priority:       s.tcPriority,
+-		networkMonitor: s.inbound.networkManager.NetworkMonitor(),
+-		attachments:    make(map[string]*sharedTCAttachment),
++		backend:          backend,
++		logger:           s.inbound.logger,
++		interfaces:       s.interfaces,
++		androidTethering: s.androidTethering,
++		enableIPv4:       s.inbound.redirectIPv4Prefix.IsValid(),
++		priority:         s.tcPriority,
++		networkMonitor:   s.inbound.networkManager.NetworkMonitor(),
++		attachments:      make(map[string]*sharedTCAttachment),
+ 	}
+ 	if err = s.tcManager.Start(); err != nil {
+ 		return E.Errors(err, s.Close())
+diff --git a/protocol/ebpf/shared_network_link.go b/protocol/ebpf/shared_network_link.go
+index 1ac163b9..9a39b7b8 100644
+--- a/protocol/ebpf/shared_network_link.go
++++ b/protocol/ebpf/shared_network_link.go
+@@ -3,11 +3,13 @@
+ package ebpf
+ 
+ import (
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+ 	"os"
++	"path/filepath"
+ 	"strings"
+ 
+ 	"github.com/sagernet/netlink"
+@@ -40,13 +42,30 @@ func attachSharedTC(
+ 			return nil, err
+ 		}
+ 	}
+-	if err := ensureClsact(link); err != nil {
++	clsact, createdClsact, err := ensureClsact(link)
++	if err != nil {
+ 		if restoreRouteLocalnet {
+ 			_ = restoreSharedRouteLocalnet(link.Attrs().Name)
+ 		}
+ 		return nil, err
+ 	}
+-	egress, _, err := attachSharedTCFilter(
++	attachment := &sharedTCAttachment{
++		interfaceName:        link.Attrs().Name,
++		interfaceIndex:       link.Attrs().Index,
++		interfaceLock:        interfaceLock,
++		restoreRouteLocalnet: restoreRouteLocalnet,
++		createdClsact:        createdClsact,
++		clsact:               clsact,
++	}
++	attachment.journalPath, err = writeSharedTCJournal(attachment)
++	if err != nil {
++		if restoreRouteLocalnet {
++			_ = restoreSharedRouteLocalnet(link.Attrs().Name)
++		}
++		_ = removeOwnedSharedClsact(link.Attrs().Name, link.Attrs().Index, clsact, createdClsact)
++		return nil, err
++	}
++	attachment.egress, _, err = attachSharedTCFilter(
+ 		link,
+ 		netlink.HANDLE_MIN_EGRESS,
+ 		backend.EgressProgramFD(),
+@@ -57,12 +76,9 @@ func attachSharedTC(
+ 		true,
+ 	)
+ 	if err != nil {
+-		if restoreRouteLocalnet {
+-			_ = restoreSharedRouteLocalnet(link.Attrs().Name)
+-		}
+-		return nil, err
++		return nil, E.Errors(err, rollbackSharedTCAttachment(attachment))
+ 	}
+-	ingress, _, err := attachSharedTCFilter(
++	attachment.ingress, _, err = attachSharedTCFilter(
+ 		link,
+ 		netlink.HANDLE_MIN_INGRESS,
+ 		backend.IngressProgramFD(),
+@@ -73,24 +89,37 @@ func attachSharedTC(
+ 		true,
+ 	)
+ 	if err != nil {
+-		var routeErr error
+-		if restoreRouteLocalnet {
+-			routeErr = restoreSharedRouteLocalnet(link.Attrs().Name)
+-		}
+-		return nil, E.Errors(err, detachSharedTCFilter(egress), routeErr)
+-	}
+-	attachment := &sharedTCAttachment{
+-		interfaceName:        link.Attrs().Name,
+-		interfaceIndex:       link.Attrs().Index,
+-		interfaceLock:        interfaceLock,
+-		ingress:              ingress,
+-		egress:               egress,
+-		restoreRouteLocalnet: restoreRouteLocalnet,
++		return nil, E.Errors(err, rollbackSharedTCAttachment(attachment))
+ 	}
+ 	closeInterfaceLock = false
+ 	return attachment, nil
+ }
+ 
++func rollbackSharedTCAttachment(attachment *sharedTCAttachment) error {
++	var routeErr error
++	if attachment.restoreRouteLocalnet {
++		routeErr = restoreSharedRouteLocalnet(attachment.interfaceName)
++	}
++	cleanupErr := E.Errors(
++		detachSharedTCFilter(attachment.ingress),
++		detachSharedTCFilter(attachment.egress),
++		routeErr,
++		removeOwnedSharedClsact(
++			attachment.interfaceName,
++			attachment.interfaceIndex,
++			attachment.clsact,
++			attachment.createdClsact,
++		),
++	)
++	if cleanupErr == nil && attachment.journalPath != "" {
++		cleanupErr = os.Remove(attachment.journalPath)
++		if errors.Is(cleanupErr, os.ErrNotExist) {
++			cleanupErr = nil
++		}
++	}
++	return cleanupErr
++}
++
+ func acquireSharedTCInterfaceLock(interfaceName string, interfaceIndex int) (*net.UnixConn, error) {
+ 	address := &net.UnixAddr{
+ 		Name: "@sing-box-ebpf-shared-" + fmt.Sprint(interfaceIndex),
+@@ -178,10 +207,7 @@ func attachSharedTCFilter(
+ 			) {
+ 				return bpfFilter, false, nil
+ 			}
+-			if err = netlink.FilterDel(existing); err != nil && !errors.Is(err, unix.ENOENT) {
+-				return nil, false, err
+-			}
+-			continue
++			return nil, false, E.New("TC filter name conflict on ", link.Attrs().Name)
+ 		}
+ 		if existing.Attrs().Handle == filterHandle {
+ 			return nil, false, E.New("TC filter handle conflict on ", link.Attrs().Name)
+@@ -229,9 +255,24 @@ func repairSharedTC(
+ 	backend *ECommon.SharedNetworkBackend,
+ 	priority uint16,
+ ) (bool, error) {
+-	if err := ensureClsact(link); err != nil {
++	clsact, createdClsact, err := ensureClsact(link)
++	if err != nil {
+ 		return false, err
+ 	}
++	if createdClsact {
++		previousClsact := attachment.clsact
++		previousCreatedClsact := attachment.createdClsact
++		attachment.clsact = clsact
++		attachment.createdClsact = true
++		journalPath, journalErr := writeSharedTCJournal(attachment)
++		if journalErr != nil {
++			attachment.clsact = previousClsact
++			attachment.createdClsact = previousCreatedClsact
++			_ = removeOwnedSharedClsact(link.Attrs().Name, link.Attrs().Index, clsact, true)
++			return false, journalErr
++		}
++		attachment.journalPath = journalPath
++	}
+ 	repaired := false
+ 	egress, egressRepaired, err := attachSharedTCFilter(
+ 		link,
+@@ -301,14 +342,14 @@ func detachSharedTCFilter(filter *netlink.BpfFilter) error {
+ 	return err
+ }
+ 
+-func ensureClsact(link netlink.Link) error {
++func ensureClsact(link netlink.Link) (netlink.Qdisc, bool, error) {
+ 	qdiscs, err := netlink.QdiscList(link)
+ 	if err != nil {
+-		return err
++		return nil, false, err
+ 	}
+ 	for _, qdisc := range qdiscs {
+ 		if qdisc.Type() == "clsact" {
+-			return nil
++			return qdisc, false, nil
+ 		}
+ 	}
+ 	qdisc := &netlink.GenericQdisc{
+@@ -320,9 +361,94 @@ func ensureClsact(link netlink.Link) error {
+ 		QdiscType: "clsact",
+ 	}
+ 	if err = netlink.QdiscAdd(qdisc); err != nil && !errors.Is(err, unix.EEXIST) {
++		return nil, false, err
++	}
++	if errors.Is(err, unix.EEXIST) {
++		return qdisc, false, nil
++	}
++	return qdisc, true, nil
++}
++
++type sharedTCJournal struct {
++	InterfaceName         string `json:"interfaceName"`
++	InterfaceIndex        int    `json:"interfaceIndex"`
++	RouteLocalnetOriginal int    `json:"routeLocalnetOriginal"`
++	CreatedClsact         bool   `json:"createdClsact"`
++}
++
++func writeSharedTCJournal(attachment *sharedTCAttachment) (string, error) {
++	runtimeDirectory := os.Getenv("AKIHALINK_RUNTIME")
++	if runtimeDirectory == "" {
++		return "", nil
++	}
++	directory := filepath.Join(runtimeDirectory, "shared-network")
++	if err := os.MkdirAll(directory, 0o700); err != nil {
++		return "", err
++	}
++	record := sharedTCJournal{
++		InterfaceName:         attachment.interfaceName,
++		InterfaceIndex:        attachment.interfaceIndex,
++		RouteLocalnetOriginal: 1,
++		CreatedClsact:         attachment.createdClsact,
++	}
++	if attachment.restoreRouteLocalnet {
++		record.RouteLocalnetOriginal = 0
++	}
++	content, err := json.Marshal(record)
++	if err != nil {
++		return "", err
++	}
++	path := filepath.Join(directory, fmt.Sprintf("%d.json", attachment.interfaceIndex))
++	temporary, err := os.CreateTemp(directory, ".attachment-")
++	if err != nil {
++		return "", err
++	}
++	temporaryName := temporary.Name()
++	defer os.Remove(temporaryName)
++	if err = temporary.Chmod(0o600); err == nil {
++		_, err = temporary.Write(content)
++	}
++	closeErr := temporary.Close()
++	if err == nil {
++		err = closeErr
++	}
++	if err != nil {
++		return "", err
++	}
++	if err = os.Rename(temporaryName, path); err != nil {
++		return "", err
++	}
++	return path, nil
++}
++
++func removeOwnedSharedClsact(interfaceName string, interfaceIndex int, qdisc netlink.Qdisc, created bool) error {
++	if !created || qdisc == nil {
++		return nil
++	}
++	link, err := netlink.LinkByIndex(interfaceIndex)
++	if errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ENOENT) {
++		return nil
++	}
++	if err != nil {
+ 		return err
+ 	}
+-	return nil
++	if link.Attrs() == nil || link.Attrs().Name != interfaceName {
++		return nil
++	}
++	for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
++		filters, listErr := netlink.FilterList(link, parent)
++		if listErr != nil {
++			return listErr
++		}
++		if len(filters) != 0 {
++			return nil
++		}
++	}
++	err = netlink.QdiscDel(qdisc)
++	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ESRCH) {
++		return nil
++	}
++	return err
+ }
+ 
+ func sharedHostAddresses() ([]netip.Addr, error) {
+diff --git a/protocol/ebpf/shared_network_tc.go b/protocol/ebpf/shared_network_tc.go
+index 6036f21c..09d3b829 100644
+--- a/protocol/ebpf/shared_network_tc.go
++++ b/protocol/ebpf/shared_network_tc.go
+@@ -6,6 +6,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"net"
++	"os"
+ 	"sort"
+ 	"strings"
+ 	"sync"
+@@ -29,20 +30,24 @@ const (
+ )
+ 
+ type sharedTCManager struct {
+-	backend         *ECommon.SharedNetworkBackend
+-	logger          sharedNetworkLogger
+-	interfaces      []string
+-	enableIPv4      bool
+-	priority        uint16
+-	access          sync.Mutex
+-	attachments     map[string]*sharedTCAttachment
+-	enabled         bool
+-	cancel          context.CancelFunc
+-	done            chan struct{}
+-	wake            chan struct{}
+-	networkMonitor  tun.NetworkUpdateMonitor
+-	networkCallback *list.Element[tun.NetworkUpdateCallback]
+-	refreshWarnings warningLimiter
++	backend           *ECommon.SharedNetworkBackend
++	logger            sharedNetworkLogger
++	interfaces        []string
++	androidTethering  string
++	enableIPv4        bool
++	priority          uint16
++	access            sync.Mutex
++	attachments       map[string]*sharedTCAttachment
++	enabled           bool
++	cancel            context.CancelFunc
++	done              chan struct{}
++	wake              chan struct{}
++	networkMonitor    tun.NetworkUpdateMonitor
++	networkCallback   *list.Element[tun.NetworkUpdateCallback]
++	refreshWarnings   warningLimiter
++	discoverAndroid   func(context.Context) ([]string, error)
++	discoveryFailures int
++	failed            bool
+ }
+ 
+ type sharedNetworkLogger interface {
+@@ -57,12 +62,21 @@ type sharedTCAttachment struct {
+ 	ingress              *netlink.BpfFilter
+ 	egress               *netlink.BpfFilter
+ 	restoreRouteLocalnet bool
++	createdClsact        bool
++	clsact               netlink.Qdisc
++	journalPath          string
+ }
+ 
+ func (m *sharedTCManager) Start() error {
+ 	if m.priority == 0 {
+ 		m.priority = defaultSharedNetworkTCPriority
+ 	}
++	if m.androidTethering == androidTetheringWiFi {
++		if m.discoverAndroid == nil {
++			m.discoverAndroid = discoverAndroidWiFiTethering
++		}
++		_ = writeAndroidHotspotState("waiting")
++	}
+ 	if err := m.reconcile(); err != nil {
+ 		return E.Errors(err, m.closeAttachments())
+ 	}
+@@ -105,6 +119,47 @@ func (m *sharedTCManager) Wake() {
+ }
+ 
+ func (m *sharedTCManager) reconcile() error {
++	if m.failed {
++		return nil
++	}
++	err := m.reconcileOnce()
++	if m.androidTethering != androidTetheringWiFi {
++		return err
++	}
++	if err != nil {
++		var discoveryError *androidTetheringDiscoveryError
++		if errors.As(err, &discoveryError) {
++			m.discoveryFailures++
++			if m.discoveryFailures >= androidTetheringFailureLimit {
++				m.failed = true
++			}
++		} else {
++			m.failed = true
++		}
++		if closeErr := m.closeAttachments(); closeErr != nil {
++			m.refreshWarnings.warn(m.logger, "detach failed Android hotspot interfaces: ", closeErr)
++		}
++		state := "waiting"
++		if m.failed {
++			state = "failed"
++		}
++		_ = writeAndroidHotspotState(state)
++		m.refreshWarnings.warn(m.logger, "refresh Android Wi-Fi hotspot interfaces: ", err)
++		return nil
++	}
++	m.discoveryFailures = 0
++	m.access.Lock()
++	attached := len(m.attachments) > 0
++	m.access.Unlock()
++	if attached {
++		_ = writeAndroidHotspotState("attached")
++	} else {
++		_ = writeAndroidHotspotState("waiting")
++	}
++	return nil
++}
++
++func (m *sharedTCManager) reconcileOnce() error {
+ 	hostAddresses, err := sharedHostAddresses()
+ 	if err != nil {
+ 		return err
+@@ -112,8 +167,15 @@ func (m *sharedTCManager) reconcile() error {
+ 	if err = m.backend.UpdateHostAddresses(hostAddresses); err != nil {
+ 		return err
+ 	}
+-	desired := make(map[string]netlink.Link, len(m.interfaces))
+-	for _, interfaceName := range m.interfaces {
++	interfaces := m.interfaces
++	if m.androidTethering == androidTetheringWiFi {
++		interfaces, err = m.discoverAndroid(context.Background())
++		if err != nil {
++			return err
++		}
++	}
++	desired := make(map[string]netlink.Link, len(interfaces))
++	for _, interfaceName := range interfaces {
+ 		link, linkErr := netlink.LinkByName(interfaceName)
+ 		if isSharedNetworkLinkNotFound(linkErr) {
+ 			continue
+@@ -196,25 +258,53 @@ func (m *sharedTCManager) updateEnabledLocked(enabled bool) error {
+ }
+ 
+ func (m *sharedTCManager) detachLocked(attachment *sharedTCAttachment) error {
++	link, linkErr := netlink.LinkByName(attachment.interfaceName)
++	if isSharedNetworkLinkNotFound(linkErr) || linkErr == nil &&
++		(link.Attrs() == nil || link.Attrs().Index != attachment.interfaceIndex) {
++		var lockErr error
++		if attachment.interfaceLock != nil {
++			lockErr = attachment.interfaceLock.Close()
++			attachment.interfaceLock = nil
++		}
++		var journalErr error
++		if attachment.journalPath != "" {
++			journalErr = os.Remove(attachment.journalPath)
++			if errors.Is(journalErr, os.ErrNotExist) {
++				journalErr = nil
++			}
++		}
++		return E.Errors(lockErr, journalErr)
++	}
++	if linkErr != nil {
++		return linkErr
++	}
+ 	detachErr := E.Errors(
+ 		detachSharedTCFilter(attachment.ingress),
+ 		detachSharedTCFilter(attachment.egress),
+ 	)
+-	if detachErr != nil {
+-		return detachErr
+-	}
++	var routeErr error
+ 	if attachment.restoreRouteLocalnet {
+-		if err := restoreSharedRouteLocalnet(attachment.interfaceName); err != nil {
+-			return err
+-		}
++		routeErr = restoreSharedRouteLocalnet(attachment.interfaceName)
+ 	}
++	qdiscErr := removeOwnedSharedClsact(
++		attachment.interfaceName,
++		attachment.interfaceIndex,
++		attachment.clsact,
++		attachment.createdClsact,
++	)
++	var lockErr error
+ 	if attachment.interfaceLock != nil {
+-		if err := attachment.interfaceLock.Close(); err != nil {
+-			return err
+-		}
++		lockErr = attachment.interfaceLock.Close()
+ 		attachment.interfaceLock = nil
+ 	}
+-	return nil
++	cleanupErr := E.Errors(detachErr, routeErr, qdiscErr, lockErr)
++	if cleanupErr == nil && attachment.journalPath != "" {
++		cleanupErr = os.Remove(attachment.journalPath)
++		if errors.Is(cleanupErr, os.ErrNotExist) {
++			cleanupErr = nil
++		}
++	}
++	return cleanupErr
+ }
+ 
+ func (m *sharedTCManager) InterfaceString() string {
+@@ -226,6 +316,9 @@ func (m *sharedTCManager) InterfaceString() string {
+ 	}
+ 	sort.Strings(names)
+ 	if len(names) == 0 {
++		if m.androidTethering == androidTetheringWiFi {
++			return "waiting for Android Wi-Fi tethering"
++		}
+ 		return "waiting for " + strings.Join(m.interfaces, ", ")
+ 	}
+ 	return strings.Join(names, ", ")

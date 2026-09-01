@@ -1,0 +1,24 @@
+diff --git a/dns/router.go b/dns/router.go
+index af37ca29..e122adcf 100644
+--- a/dns/router.go
++++ b/dns/router.go
+@@ -10,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/contentprewarm"
+ 	"github.com/sagernet/sing-box/common/taskmonitor"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/experimental/deprecated"
+@@ -150,6 +151,11 @@ func (r *Router) Start(stage adapter.StartStage) error {
+ 		r.legacyDNSMode = legacyDNSMode
+ 		r.started = true
+ 		r.rulesAccess.Unlock()
++		go func() {
++			if prewarmErr := contentprewarm.Start(r.ctx, r); prewarmErr != nil {
++				r.logger.Warn("proxy DNS startup health check deferred: ", prewarmErr)
++			}
++		}()
+ 		if legacyDNSMode && common.Any(newRules, func(rule adapter.DNSRule) bool { return rule.WithAddressLimit() }) {
+ 			deprecated.Report(r.ctx, deprecated.OptionLegacyDNSAddressFilter)
+ 		}

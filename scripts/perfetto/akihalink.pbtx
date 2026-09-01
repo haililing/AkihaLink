@@ -1,0 +1,60 @@
+buffers: {
+  size_kb: 32768
+  fill_policy: RING_BUFFER
+}
+buffers: {
+  size_kb: 8192
+  fill_policy: RING_BUFFER
+}
+data_sources: {
+  config {
+    name: "linux.ftrace"
+    target_buffer: 0
+    ftrace_config {
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "sched/sched_waking"
+      ftrace_events: "power/cpu_frequency"
+      ftrace_events: "power/cpu_idle"
+      ftrace_events: "binder/binder_transaction"
+      ftrace_events: "binder/binder_transaction_received"
+      ftrace_events: "net/net_dev_queue"
+      ftrace_events: "net/netif_receive_skb"
+      atrace_categories: "am"
+      atrace_categories: "binder_driver"
+      atrace_categories: "dalvik"
+      atrace_categories: "freq"
+      atrace_categories: "gfx"
+      atrace_categories: "idle"
+      atrace_categories: "network"
+      atrace_categories: "sched"
+      atrace_categories: "view"
+      atrace_categories: "wm"
+      atrace_apps: "com.akiha.akihalink"
+    }
+  }
+}
+data_sources: {
+  config {
+    name: "linux.process_stats"
+    target_buffer: 1
+    process_stats_config {
+      scan_all_processes_on_start: true
+      proc_stats_poll_ms: 1000
+    }
+  }
+}
+data_sources: {
+  config {
+    name: "linux.sys_stats"
+    target_buffer: 1
+    sys_stats_config {
+      stat_period_ms: 1000
+      stat_counters: STAT_CPU_TIMES
+      stat_counters: STAT_FORK_COUNT
+    }
+  }
+}
+duration_ms: 30000
+flush_period_ms: 1000
+write_into_file: true
+file_write_period_ms: 2500

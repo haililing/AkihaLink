@@ -1,0 +1,7 @@
+id=akihalink
+name=AkihaLink
+version=1.1
+versionCode=23
+author=AkihaLink contributors
+description=Android 16 arm64 sing-box eBPF proxy runtime (control protocol 16, optional Wi-Fi hotspot proxy, and on-demand TCP diagnostics)
+updateJson=

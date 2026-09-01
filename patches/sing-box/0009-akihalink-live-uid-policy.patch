@@ -1,0 +1,441 @@
+diff --git a/common/ebpf/cgroup_backend_cgo.go b/common/ebpf/cgroup_backend_cgo.go
+index cd562f5e..9f61cffd 100644
+--- a/common/ebpf/cgroup_backend_cgo.go
++++ b/common/ebpf/cgroup_backend_cgo.go
+@@ -118,6 +118,7 @@ import "C"
+ import (
+ 	_ "embed"
+ 	"net/netip"
++	"slices"
+ 	"sync"
+ 	"sync/atomic"
+ 	"syscall"
+@@ -151,6 +152,10 @@ type CgroupBackend struct {
+ 	bypassIPv4CIDRMapFD   int
+ 	bypassIPv6CIDRMapFD   int
+ 	ipv6AvailableMapFD    int
++	uidPolicyMapFD        int
++	uidPolicyEntries      []uidLPMKey
++	uidPolicy             CgroupPolicy
++	uidDefaultBypass      bool
+ 	bypassIPv4CIDR        []netip.Prefix
+ 	bypassIPv6CIDR        []netip.Prefix
+ 	cgroupPath            string
+@@ -278,6 +283,10 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
+ 		bypassIPv4CIDRMapFD:  int(runtimeState.bypass_ipv4_cidr_map_fd),
+ 		bypassIPv6CIDRMapFD:  int(runtimeState.bypass_ipv6_cidr_map_fd),
+ 		ipv6AvailableMapFD:   int(runtimeState.ipv6_available_map_fd),
++		uidPolicyMapFD:       int(runtimeState.uid_policy_map_fd),
++		uidPolicyEntries:     slices.Clone(uidPolicyEntries),
++		uidPolicy:            cloneCgroupPolicy(policy),
++		uidDefaultBypass:     uidDefaultBypass,
+ 		cgroupPath:           cgroupPath,
+ 		redirectIPv4:         redirectIPv4,
+ 		redirectIPv6:         redirectIPv6,
+@@ -540,6 +549,9 @@ func (b *CgroupBackend) Close() error {
+ 		b.bypassIPv4CIDRMapFD = -1
+ 		b.bypassIPv6CIDRMapFD = -1
+ 		b.ipv6AvailableMapFD = -1
++		b.uidPolicyMapFD = -1
++		b.uidPolicyEntries = nil
++		b.uidPolicy = CgroupPolicy{}
+ 		b.bypassIPv4CIDR = nil
+ 		b.bypassIPv6CIDR = nil
+ 	}
+diff --git a/common/ebpf/cgroup_policy_cgo.go b/common/ebpf/cgroup_policy_cgo.go
+index 49725cb0..441ed4d7 100644
+--- a/common/ebpf/cgroup_policy_cgo.go
++++ b/common/ebpf/cgroup_policy_cgo.go
+@@ -15,6 +15,7 @@ import (
+ 
+ var (
+ 	uidPolicyUpdateBatchSupport  mapBatchSupport
++	uidPolicyDeleteBatchSupport  mapBatchSupport
+ 	bypassCIDRUpdateBatchSupport mapBatchSupport
+ 	bypassCIDRDeleteBatchSupport mapBatchSupport
+ )
+diff --git a/common/ebpf/cgroup_stub.go b/common/ebpf/cgroup_stub.go
+index f69c7ab9..b0fd1a84 100644
+--- a/common/ebpf/cgroup_stub.go
++++ b/common/ebpf/cgroup_stub.go
+@@ -36,6 +36,10 @@ func (b *CgroupBackend) UpdateBypassCIDR([]netip.Prefix) (bool, error) {
+ 	return false, E.New("eBPF inbound is not supported by this build: cgo is disabled")
+ }
+ 
++func (b *CgroupBackend) ReplaceExcludeUIDPolicy([]UIDRange) error {
++	return E.New("eBPF inbound is not supported by this build: cgo is disabled")
++}
++
+ func (b *CgroupBackend) BypassCIDRCount() (int, int) {
+ 	return 0, 0
+ }
+diff --git a/common/ebpf/uid_policy_live.go b/common/ebpf/uid_policy_live.go
+new file mode 100644
+index 00000000..8070540d
+--- /dev/null
++++ b/common/ebpf/uid_policy_live.go
+@@ -0,0 +1,184 @@
++//go:build with_ebpf && (linux || android) && cgo
++
++package ebpf
++
++import (
++	"errors"
++	"slices"
++	"unsafe"
++
++	E "github.com/sagernet/sing/common/exceptions"
++	"golang.org/x/sys/unix"
++)
++
++// ReplaceExcludeUIDPolicy updates the already attached cgroup eBPF policy.
++// Adding entries before removing stale entries avoids a window where a newly
++// excluded application could be redirected by the old policy.
++func (b *CgroupBackend) ReplaceExcludeUIDPolicy(uidRanges []UIDRange) error {
++	if b == nil {
++		return errBackendClosed
++	}
++	b.access.Lock()
++	defer b.access.Unlock()
++	if err := b.health.requireUsable(b.runtime != nil); err != nil {
++		return err
++	}
++	nextPolicy := cloneCgroupPolicy(b.uidPolicy)
++	nextPolicy.ExcludeUID = slices.Clone(uidRanges)
++	entries, defaultBypass, err := compileUIDPolicy(nextPolicy)
++	if err != nil {
++		return err
++	}
++	if defaultBypass != b.uidDefaultBypass {
++		return E.New("live UID policy update changed default bypass semantics")
++	}
++	if slices.Equal(entries, b.uidPolicyEntries) {
++		b.uidPolicy = nextPolicy
++		return nil
++	}
++	if err = replaceUIDPolicyMap(b.uidPolicyMapFD, b.uidPolicyEntries, entries); err != nil {
++		if policyRollbackFailed(err) {
++			return E.Errors(err, b.health.invalidate("cgroup", "UID policy"))
++		}
++		return err
++	}
++	b.uidPolicyEntries = slices.Clone(entries)
++	b.uidPolicy = nextPolicy
++	return nil
++}
++
++func cloneCgroupPolicy(policy CgroupPolicy) CgroupPolicy {
++	policy.IncludeUID = slices.Clone(policy.IncludeUID)
++	policy.ExcludeUID = slices.Clone(policy.ExcludeUID)
++	return policy
++}
++
++func replaceUIDPolicyMap(mapFD int, currentEntries []uidLPMKey, nextEntries []uidLPMKey) error {
++	if mapFD < 0 {
++		return errBackendClosed
++	}
++	current := make(map[uidLPMKey]struct{}, len(currentEntries))
++	for _, entry := range currentEntries {
++		current[entry] = struct{}{}
++	}
++	next := make(map[uidLPMKey]struct{}, len(nextEntries))
++	for _, entry := range nextEntries {
++		next[entry] = struct{}{}
++	}
++	additions := make([]uidLPMKey, 0, len(next))
++	for entry := range next {
++		if _, exists := current[entry]; !exists {
++			additions = append(additions, entry)
++		}
++	}
++	removals := make([]uidLPMKey, 0, len(current))
++	for entry := range current {
++		if _, exists := next[entry]; !exists {
++			removals = append(removals, entry)
++		}
++	}
++	if len(additions) == 0 && len(removals) == 0 {
++		return nil
++	}
++	added, err := addUIDPolicyEntries(mapFD, additions)
++	if err != nil {
++		return policyUpdateError(err, rollbackUIDPolicyMap(mapFD, added, nil))
++	}
++	removed, err := removeUIDPolicyEntries(mapFD, removals)
++	if err != nil {
++		return policyUpdateError(err, rollbackUIDPolicyMap(mapFD, added, removed))
++	}
++	return nil
++}
++
++func addUIDPolicyEntries(mapFD int, entries []uidLPMKey) ([]uidLPMKey, error) {
++	if len(entries) == 0 {
++		return nil, nil
++	}
++	values := make([]uint8, len(entries))
++	for index := range values {
++		values[index] = 1
++	}
++	processed, err := updateMapBatch(
++		mapFD,
++		unsafe.Pointer(&entries[0]),
++		unsafe.Pointer(&values[0]),
++		uint32(len(entries)),
++		unsafe.Sizeof(entries[0]),
++		unsafe.Sizeof(values[0]),
++		bpfNoExist,
++		&uidPolicyUpdateBatchSupport,
++	)
++	if processed > uint32(len(entries)) {
++		return nil, E.New("invalid eBPF batch update count: ", processed)
++	}
++	added := slices.Clone(entries[:processed])
++	if err == nil {
++		return added, nil
++	}
++	if !errors.Is(err, unix.EEXIST) {
++		return added, err
++	}
++	value := uint8(1)
++	for _, entry := range entries[processed:] {
++		err = updateMapWithFlags(mapFD, unsafe.Pointer(&entry), unsafe.Pointer(&value), bpfNoExist)
++		if errors.Is(err, unix.EEXIST) {
++			continue
++		}
++		if err != nil {
++			return added, err
++		}
++		added = append(added, entry)
++	}
++	return added, nil
++}
++
++func removeUIDPolicyEntries(mapFD int, entries []uidLPMKey) ([]uidLPMKey, error) {
++	if len(entries) == 0 {
++		return nil, nil
++	}
++	processed, err := deleteMapBatch(
++		mapFD,
++		unsafe.Pointer(&entries[0]),
++		uint32(len(entries)),
++		unsafe.Sizeof(entries[0]),
++		&uidPolicyDeleteBatchSupport,
++	)
++	if processed > uint32(len(entries)) {
++		return nil, E.New("invalid eBPF batch delete count: ", processed)
++	}
++	removed := slices.Clone(entries[:processed])
++	if err == nil {
++		return removed, nil
++	}
++	if !errors.Is(err, unix.ENOENT) {
++		return removed, err
++	}
++	for _, entry := range entries[processed:] {
++		err = deleteMap(mapFD, unsafe.Pointer(&entry))
++		if errors.Is(err, unix.ENOENT) {
++			continue
++		}
++		if err != nil {
++			return removed, err
++		}
++		removed = append(removed, entry)
++	}
++	return removed, nil
++}
++
++func rollbackUIDPolicyMap(mapFD int, added, removed []uidLPMKey) error {
++	var rollbackErr error
++	value := uint8(1)
++	for _, entry := range removed {
++		if err := updateMap(mapFD, unsafe.Pointer(&entry), unsafe.Pointer(&value)); err != nil {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	for _, entry := range added {
++		if err := deleteMap(mapFD, unsafe.Pointer(&entry)); err != nil && !errors.Is(err, unix.ENOENT) {
++			rollbackErr = E.Errors(rollbackErr, err)
++		}
++	}
++	return rollbackErr
++}
+diff --git a/protocol/ebpf/inbound.go b/protocol/ebpf/inbound.go
+index 9e18d8f4..70dceb34 100644
+--- a/protocol/ebpf/inbound.go
++++ b/protocol/ebpf/inbound.go
+@@ -63,6 +63,7 @@ type Inbound struct {
+ 	cgroupPolicy             ECommon.CgroupPolicy
+ 	androidUIDOptions        *androidUIDOptions
+ 	localRoutes              []*localRoute
++	uidPolicyControl         *uidPolicyControl
+ 	sharedNetworkOptions     option.EBPFSharedNetworkOptions
+ 	sharedNetworkMapCapacity ECommon.SharedNetworkMapCapacities
+ 	bypassPrivateAddress     bool
+diff --git a/protocol/ebpf/inbound_lifecycle.go b/protocol/ebpf/inbound_lifecycle.go
+index 25c6919f..ab4f8fc1 100644
+--- a/protocol/ebpf/inbound_lifecycle.go
++++ b/protocol/ebpf/inbound_lifecycle.go
+@@ -74,6 +74,7 @@ func (i *Inbound) Start(stage adapter.StartStage) error {
+ 					"cgroup socket-release is unavailable; using LRU cleanup fallback for UDP redirect state",
+ 				)
+ 			}
++			i.startUIDPolicyControl()
+ 			bypassIPv4Count, bypassIPv6Count := backend.BypassCIDRCount()
+ 			selfBypassMode := backend.SelfBypassMode()
+ 			socketBypassCapacity := i.cgroupMapCapacity.SocketBypass
+@@ -165,6 +166,7 @@ func (i *Inbound) cleanupStartFailure() error {
+ }
+ 
+ func (i *Inbound) closeResources() error {
++	i.stopUIDPolicyControl()
+ 	i.stopTCPRedirectJanitor()
+ 	i.resetCgroupIPv6ProbeLocked()
+ 	i.udpNat.Purge()
+diff --git a/protocol/ebpf/uid_policy_control.go b/protocol/ebpf/uid_policy_control.go
+new file mode 100644
+index 00000000..b62c9eb7
+--- /dev/null
++++ b/protocol/ebpf/uid_policy_control.go
+@@ -0,0 +1,142 @@
++//go:build with_ebpf && (linux || android)
++
++package ebpf
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"runtime"
++	"time"
++
++	ECommon "github.com/sagernet/sing-box/common/ebpf"
++	"golang.org/x/sys/unix"
++)
++
++type uidPolicyControl struct {
++	listener net.Listener
++	path     string
++}
++
++type uidPolicyUpdateRequest struct {
++	ExcludeUID      []uint32 `json:"exclude_uid"`
++	ExcludeUIDRange []string `json:"exclude_uid_range"`
++}
++
++type uidPolicyUpdateResponse struct {
++	OK    bool   `json:"ok"`
++	Error string `json:"error,omitempty"`
++}
++
++func (i *Inbound) startUIDPolicyControl() {
++	if !i.cgroupEnabled || i.uidPolicyControl != nil {
++		return
++	}
++	socketPath := os.Getenv("AKIHALINK_UID_POLICY_SOCKET")
++	if socketPath == "" {
++		return
++	}
++	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
++		i.logger.Warn("create eBPF UID policy socket directory: ", err)
++		return
++	}
++	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
++		i.logger.Warn("remove stale eBPF UID policy socket: ", err)
++		return
++	}
++	listener, err := net.Listen("unix", socketPath)
++	if err != nil {
++		i.logger.Warn("listen for eBPF UID policy updates: ", err)
++		return
++	}
++	if err = os.Chmod(socketPath, 0o600); err != nil {
++		_ = listener.Close()
++		_ = os.Remove(socketPath)
++		i.logger.Warn("protect eBPF UID policy socket: ", err)
++		return
++	}
++	control := &uidPolicyControl{listener: listener, path: socketPath}
++	i.uidPolicyControl = control
++	go i.serveUIDPolicyControl(control)
++}
++
++func (i *Inbound) stopUIDPolicyControl() {
++	control := i.uidPolicyControl
++	i.uidPolicyControl = nil
++	if control == nil {
++		return
++	}
++	_ = control.listener.Close()
++	_ = os.Remove(control.path)
++}
++
++func (i *Inbound) serveUIDPolicyControl(control *uidPolicyControl) {
++	for {
++		connection, err := control.listener.Accept()
++		if err != nil {
++			return
++		}
++		unixConnection, ok := connection.(*net.UnixConn)
++		if !ok {
++			_ = connection.Close()
++			continue
++		}
++		go i.handleUIDPolicyConnection(unixConnection)
++	}
++}
++
++func (i *Inbound) handleUIDPolicyConnection(connection *net.UnixConn) {
++	defer connection.Close()
++	_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
++	response := uidPolicyUpdateResponse{}
++	if !uidPolicyPeerIsRoot(connection) {
++		response.Error = "UID policy updates require root"
++		_ = json.NewEncoder(connection).Encode(response)
++		return
++	}
++	var request uidPolicyUpdateRequest
++	if err := json.NewDecoder(io.LimitReader(connection, 1<<20)).Decode(&request); err != nil {
++		response.Error = "invalid UID policy update"
++		_ = json.NewEncoder(connection).Encode(response)
++		return
++	}
++	if err := i.updateExcludedUIDPolicy(request); err != nil {
++		response.Error = err.Error()
++	} else {
++		response.OK = true
++	}
++	_ = json.NewEncoder(connection).Encode(response)
++}
++
++func uidPolicyPeerIsRoot(connection *net.UnixConn) bool {
++	rawConnection, err := connection.SyscallConn()
++	if err != nil {
++		return false
++	}
++	var credential *unix.Ucred
++	var controlErr error
++	err = rawConnection.Control(func(fd uintptr) {
++		credential, controlErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
++	})
++	return err == nil && controlErr == nil && credential != nil && credential.Uid == 0
++}
++
++func (i *Inbound) updateExcludedUIDPolicy(request uidPolicyUpdateRequest) error {
++	ranges, err := parseUIDRanges(request.ExcludeUID, request.ExcludeUIDRange)
++	if err != nil {
++		return err
++	}
++	ranges = append(ranges, platformExcludedUIDRanges(runtime.GOOS)...)
++	backend := i.cgroupBackendInstance()
++	if backend == nil {
++		return errors.New("eBPF backend is not available")
++	}
++	if err = backend.ReplaceExcludeUIDPolicy(ranges); err != nil {
++		return err
++	}
++	i.cgroupPolicy.ExcludeUID = append([]ECommon.UIDRange(nil), ranges...)
++	return nil
++}
