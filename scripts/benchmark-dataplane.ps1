@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ServerHost,
     [Parameter(Mandatory = $true)]
-    [ValidateSet("0.15.0", "0.16.0", "1.1")]
+    [ValidateSet("0.15.0", "0.16.0", "1.1", "1.2.0")]
     [string]$Candidate,
     [Parameter(Mandatory = $true)]
     [ValidateSet("tcp", "hysteria2", "tuic")]

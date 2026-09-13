@@ -1,12 +1,12 @@
-# AkihaLink 1.1 Device Acceptance
+# AkihaLink 1.2.0 Device Acceptance
 
 Run this checklist on Android 16 arm64 hardware. Automated tests cannot prove
 kernel verifier, vendor SELinux, radio, and real-node compatibility.
 
 ## Preconditions
 
-- Test a matching 1.1 APK/module pair built from the same revision.
-- Keep a matching 0.16.0 pair for upgrade, comparison, and rollback tests.
+- Test a matching 1.2.0 APK/module pair built from the same revision.
+- Keep a matching 1.1 pair (core `90bb3d43`, patch set v16) for upgrade, comparison, and rollback tests; retain 0.16.0 for legacy migration coverage.
 - Retain the complete `0b6988e5` / `akihalink-upstream-ebpf-v12` release
   artifacts so the core, module, and App can be rolled back together.
 - Repeat the core workflow on KernelSU, KernelSU-Next, SukiSU Ultra, and
@@ -16,9 +16,9 @@ kernel verifier, vendor SELinux, radio, and real-node compatibility.
 
 ## Version And Compatibility
 
-- `akihalinkctl version` reports module `1.1`, protocol `16`, core commit
-  `90bb3d43634b56b38834a239f3129d3009ece9d4`, and patch set
-  `akihalink-upstream-ebpf-v16`.
+- `akihalinkctl version` reports module `1.2.0`, protocol `16`, core commit
+  `10e9a4258e44536ef30cefc3e603e39439ebc02c`, and patch set
+  `akihalink-upstream-ebpf-v17`.
 - The feature set includes `ebpf_core_relocation`, `upstream_cgroup_ebpf`,
   `flow_telemetry`, `rtnetlink_observer`, `passive_path_observation`,
   `pidfd_supervision`, `perfetto_trace_markers`, `atomic_config_activation`,
@@ -27,7 +27,8 @@ kernel verifier, vendor SELinux, radio, and real-node compatibility.
   `ebpf_kernel_probe`.
 - The feature set does not include removed scoring, content-quality, or custom
   HTTP/3-policy features.
-- Pair 1.1 App with a 0.16.0 module, then 0.16.0 App with a 1.1 module.
+- Pair 1.2.0 App with a 1.1 module, then 1.1 App with a 1.2.0 module.
+  Repeat with the older 0.16.0 pair.
   Both combinations must report a version or protocol incompatibility and must
   not be treated as operational pairs.
 
@@ -90,8 +91,8 @@ kernel verifier, vendor SELinux, radio, and real-node compatibility.
   IPv4, IPv6, fragmented packets, replies, and private-network access. Turning
   off the home proxy must immediately restore ordinary Android hotspot routing.
 - Recreate the hotspot interface with the same name and a new ifindex, switch
-  the phone's Wi-Fi upstream, and force three consecutive Tethering-state read
-  failures. Confirm old filters are removed and the final failure silently
+  the phone's Wi-Fi upstream, and force a Tethering-state read
+  failure. Confirm old filters are removed and the failure silently
   disables the setting while the phone proxy keeps running.
 - Delete one owned TC filter while the hotspot is active and wait for the next
   30-second health pass. Confirm the filter is restored. Repeat with a
@@ -173,6 +174,22 @@ kernel verifier, vendor SELinux, radio, and real-node compatibility.
   and route generation. Native QUIC DPLPMTUD remains available where upstream
   enables it.
 
+## Upgrade From 1.1
+
+- Save local-only and Wi-Fi-hotspot configurations on 1.1, including exclusions.
+- Upgrade the App and module together to 1.2.0 and start the proxy.
+- Confirm `current.json.pre-v17.bak` contains the original configuration;
+  the current file has no `mode`, `tcp_splice`, or `shared.advanced` fields.
+- Confirm local `enabled=true` / `data_plane=cgroup`, and when configured,
+  shared `enabled=true` / `data_plane=packet_rewrite` with root `tc_priority=1`.
+- Restart twice and confirm migration does not alter the backup or rewrite an
+  already-current configuration. Verify node credentials, subscription data,
+  rules, exclusions, selected node, and hotspot preference are preserved.
+- Exercise adding the first UID exclusion and removing the last one without
+  restarting the core, then verify SDK sandbox UID handling and netd DNS.
+- To roll back, restore the 1.1 App/module pair together and use the saved
+  pre-v17 configuration or regenerate it with the old App.
+
 ## Upgrade From 0.16.0
 
 - On 0.16.0, select a node, import subscriptions, configure app exclusions,
@@ -180,7 +197,7 @@ kernel verifier, vendor SELinux, radio, and real-node compatibility.
   0.14.0, retain representative legacy quality and HTTP/3 settings/files.
 - Create legacy `state/adaptive-scores-v1.json`,
   `state/adaptive-scores-v2.json`, and their `.tmp` variants.
-- Install the matching 1.1 module and App, then reboot.
+- Install the matching 1.2.0 module and App, then reboot.
 - Confirm the selected node, subscriptions, exclusions, proxy mode, and saved
   latency results are preserved.
 - Confirm no removed quality sorting or HTTP/3 policy setting returns.
@@ -198,17 +215,17 @@ kernel verifier, vendor SELinux, radio, and real-node compatibility.
   cleaned safely.
 - Confirm status remains responsive with a large observability history and
   diagnostic export provides a bounded fallback on collection timeout.
-- Alternate 0.16.0 and 1.1 on the same Android 16+ device, node, stable
+- Alternate 1.1 and 1.2.0 on the same Android 16+ device, node, stable
   network, and controlled device temperature. Run each workload at least seven
   times for at least 30 seconds.
 - Record TCP upload/download at one and four flows, 1200-byte UDP PPS/loss,
   Hysteria2/TUIC representative throughput, core CPU/bit, RSS, connection
   latency, BPF maps, file descriptors, and goroutine count.
-- Require at least 5% throughput improvement in a representative TCP, UDP, or
-  QUIC load, or at least 8% lower core CPU/bit. No throughput may regress over
+- Record throughput and CPU changes against 1.1; this core upgrade makes no
+  measured performance-improvement claim. No throughput may regress over
   3%, first-connect p95 over 5%, or UDP loss over 0.1 percentage point.
-- Confirm the core is at least 10% smaller, fallback throughput/correctness is
-  no worse than 0.16.0, and RSS has no sustained growth.
+- Record the core size change; confirm fallback correctness is unchanged and
+  RSS has no sustained growth.
 - Run the final candidate continuously for 24 hours and reject unbounded map,
   FD, or goroutine growth and unexpected core exits.
 
@@ -221,5 +238,5 @@ kernel verifier, vendor SELinux, radio, and real-node compatibility.
   `controllerReady=true`, `systemResolverAttached=true`, and
   `startupHealth=healthy` on every release device.
 - Set `AKIHALINK_DEVICE_MATRIX_ATTESTATION` to
-  `90bb3d43634b56b38834a239f3129d3009ece9d4:akihalink-upstream-ebpf-v16:1.1`.
+  `10e9a4258e44536ef30cefc3e603e39439ebc02c:akihalink-upstream-ebpf-v17:1.2.0`.
   Any core, patch-set, or App version change invalidates it.

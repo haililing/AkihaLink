@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 if (-not $PreparedSource) { $PreparedSource = Join-Path $root "build/core-source" }
-if (-not $Go) { $Go = Join-Path $root "build/toolchains/go1.26.6/bin/go.exe" }
+if (-not $Go) { $Go = Join-Path $root "build/toolchains/go1.26.7/bin/go.exe" }
 if (-not (Test-Path (Join-Path $PreparedSource "go.mod"))) {
     throw "Prepared core source is missing; run scripts/build-core.ps1 first"
 }

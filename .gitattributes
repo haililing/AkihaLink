@@ -1,3 +1,5 @@
+*.patch text eol=lf -whitespace
+core-overlay/** text eol=lf
 *.sh text eol=lf
 module/bin/akihalinkctl text eol=lf
 *.srs binary

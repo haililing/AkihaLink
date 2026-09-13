@@ -141,7 +141,7 @@ var commandAkihaDaemonUIDPolicyStatus = &cobra.Command{
 
 var commandAkihaDaemonMigrateConfig = &cobra.Command{
 	Use:   "migrate-config <config>",
-	Short: "atomically migrate a verified AkihaLink v14 eBPF configuration",
+	Short: "atomically migrate a verified AkihaLink v14/v16 eBPF configuration to v17",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(_ *cobra.Command, args []string) error {
 		result, err := akihalinkobs.MigrateV14Config(args[0])

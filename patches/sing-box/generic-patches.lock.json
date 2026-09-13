@@ -1,16 +1,16 @@
 {
-  "patchSet": "akihalink-upstream-ebpf-v16",
+  "patchSet": "akihalink-upstream-ebpf-v17",
   "dependencies": {
     "github.com/cilium/ebpf": "v0.22.1-0.20260724091036-00feb08ae4e5"
   },
   "patches": [
     {
       "file": "0007-akihalink-dns-prewarm.patch",
-      "sha256": "280afd18aa3758c3d4c536ee3db2f4c8537c1c9faaea76d9a9bb7089039f73a3"
+      "sha256": "50c8941add185189afb40112c761949a8fd4169a0cf524c3007b4b52588e0b9f"
     },
     {
       "file": "0015-akihalink-cilium-backend.patch",
-      "sha256": "a02b736e79d3bfaef404684a8bad6706bdda8a385749913a32cdf91a311c755f"
+      "sha256": "e7694cc9c656b4c638665e651b4d1da1feb52cda0b2d2701a6169d7c7cceebb6"
     }
   ]
 }

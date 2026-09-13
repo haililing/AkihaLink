@@ -64,9 +64,11 @@ class SingBoxConfigGenerator {
                 add(buildJsonObject {
                     put("type", "ebpf")
                     put("tag", "ebpf-in")
-                    put("mode", if (request.hotspotProxyEnabled) "hybrid" else "local")
+                    put("tc_priority", 1)
                     put("network", JsonArray(listOf(JsonPrimitive("tcp"), JsonPrimitive("udp"))))
                     putJsonObject("local") {
+                        put("enabled", true)
+                        put("data_plane", "cgroup")
                         put("dns_mode", "hijack")
                         putJsonArray("include_uid") {}
                         putJsonArray("include_uid_range") {}
@@ -74,12 +76,10 @@ class SingBoxConfigGenerator {
                     }
                     if (request.hotspotProxyEnabled) {
                         putJsonObject("shared") {
+                            put("enabled", true)
+                            put("data_plane", "packet_rewrite")
                             put("dns_mode", "hijack")
                             put("android_tethering", "wifi")
-                            putJsonObject("advanced") {
-                                put("tc_priority", 1)
-                                put("data_plane", "rewrite")
-                            }
                         }
                     }
                 })

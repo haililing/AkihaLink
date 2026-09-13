@@ -14,7 +14,7 @@ foreach ($name in $goEnvironmentNames) {
 $upstreamSource = if ($Source) { [IO.Path]::GetFullPath($Source) } else { Join-Path $root "third_party/sing-box" }
 if (-not $Output) { $Output = Join-Path $root "build/core/sing-box" }
 $Output = [IO.Path]::GetFullPath($Output)
-$pinnedLocalGo = Join-Path $root "build/toolchains/go1.26.6/bin/go.exe"
+$pinnedLocalGo = Join-Path $root "build/toolchains/go1.26.7/bin/go.exe"
 $goCommand = Get-Command go -ErrorAction SilentlyContinue
 $go = if (Test-Path $pinnedLocalGo) {
     $pinnedLocalGo
@@ -23,11 +23,11 @@ $go = if (Test-Path $pinnedLocalGo) {
 } else {
     Join-Path $root "build/toolchains/go/bin/go.exe"
 }
-if (-not (Test-Path $go)) { throw "Go 1.26.6 toolchain is unavailable" }
+if (-not (Test-Path $go)) { throw "Go 1.26.7 toolchain is unavailable" }
 $lock = Get-Content (Join-Path $root "patches/sing-box/patches.lock.json") -Raw | ConvertFrom-Json
 
 $goVersion = (& $go version)
-if ($goVersion -notmatch 'go1\.26\.6\b') { throw "Go 1.26.6 is required (found: $goVersion)" }
+if ($goVersion -notmatch 'go1\.26\.7\b') { throw "Go 1.26.7 is required (found: $goVersion)" }
 $hostTag = if ($IsWindows -or $env:OS -eq "Windows_NT") { "windows-x86_64" } else { "linux-x86_64" }
 $compilerName = if ($hostTag -eq "windows-x86_64") { "aarch64-linux-android35-clang.cmd" } else { "aarch64-linux-android35-clang" }
 $cc = Join-Path $Ndk "toolchains/llvm/prebuilt/$hostTag/bin/$compilerName"
@@ -121,6 +121,11 @@ $source = (& (Join-Path $PSScriptRoot "prepare-core-source.ps1") -Source $upstre
 
     $commonBpfDirectory = Join-Path $source "common/ebpf"
     $generatedBpfDirectory = Join-Path $commonBpfDirectory "internal/bpfgen"
+    # Upstream 1.15 removed splice from the loader; never ship stale generated objects.
+    foreach ($name in @("splice_bpfel.go", "splice_bpfeb.go", "splice_bpfel.o", "splice_bpfeb.o")) {
+        $stale = Join-Path $generatedBpfDirectory $name
+        if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
+    }
     $mainCFlags = @(
         "-mcpu=v1", "-O2", "-g0", "-ffreestanding",
         "-mllvm", "-disable-block-placement", "-mllvm", "-disable-branch-fold",
@@ -128,9 +133,12 @@ $source = (& (Join-Path $PSScriptRoot "prepare-core-source.ps1") -Source $upstre
         "-isystem", $sysroot, "-isystem", (Join-Path $sysroot "aarch64-linux-android")
     )
     $mainObjects = @(
+        @{ Stem = "tc"; Name = "TC"; Source = "native/tc.bpf.c" },
+        @{ Stem = "cgroup_coarse"; Name = "CgroupCoarse"; Source = "native/cgroup_coarse.bpf.c" },
+        @{ Stem = "cgroup_storage"; Name = "CgroupStorage"; Source = "native/cgroup_storage.bpf.c" },
         @{ Stem = "cgroup"; Name = "Cgroup"; Source = "native/cgroup.bpf.c" },
         @{ Stem = "shared_network"; Name = "SharedNetwork"; Source = "native/shared_network.bpf.c" },
-        @{ Stem = "splice"; Name = "Splice"; Source = "native/splice.bpf.c" }
+        @{ Stem = "fakeip_icmp"; Name = "FakeIPICMP"; Source = "native/fakeip_icmp.bpf.c" }
     )
     function Invoke-MainBpfGeneration {
         Push-Location $commonBpfDirectory
@@ -156,9 +164,9 @@ $source = (& (Join-Path $PSScriptRoot "prepare-core-source.ps1") -Source $upstre
     }
     Invoke-MainBpfGeneration
     $generatedFiles = Get-ChildItem -LiteralPath $generatedBpfDirectory -File |
-        Where-Object { $_.Name -match '^(cgroup|shared_network|splice)_bpf(e[bl])\.(go|o)$' } |
+        Where-Object { $_.Name -match '^(tc|cgroup|cgroup_coarse|cgroup_storage|shared_network|fakeip_icmp)_bpf(e[bl])\.(go|o)$' } |
         Sort-Object Name
-    if ($generatedFiles.Count -ne 12) { throw "Expected 12 generated main eBPF files, found $($generatedFiles.Count)" }
+    if ($generatedFiles.Count -ne 24) { throw "Expected 24 generated main eBPF files, found $($generatedFiles.Count)" }
     $firstGeneration = @{}
     foreach ($file in $generatedFiles) {
         $firstGeneration[$file.Name] = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash

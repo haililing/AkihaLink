@@ -1,5 +1,5 @@
 diff --git a/dns/router.go b/dns/router.go
-index af37ca29..e122adcf 100644
+index d5b0703116f724d8c9462ba244b06586ebacab34..1e93953c75dd0ca2c351bf94aa7380ac05edc7be 100644
 --- a/dns/router.go
 +++ b/dns/router.go
 @@ -10,6 +10,7 @@ import (
@@ -10,7 +10,7 @@ index af37ca29..e122adcf 100644
  	"github.com/sagernet/sing-box/common/taskmonitor"
  	C "github.com/sagernet/sing-box/constant"
  	"github.com/sagernet/sing-box/experimental/deprecated"
-@@ -150,6 +151,11 @@ func (r *Router) Start(stage adapter.StartStage) error {
+@@ -153,6 +154,11 @@ func (r *Router) Start(stage adapter.StartStage) error {
  		r.legacyDNSMode = legacyDNSMode
  		r.started = true
  		r.rulesAccess.Unlock()

@@ -9,9 +9,9 @@ LOGDIR="$DATA/log"
 CORE=${AKIHALINK_CORE:-$MODDIR/sing-box}
 SUPERVISOR=${AKIHALINK_SUPERVISOR:-$MODDIR/supervisor.sh}
 PROTOCOL=16
-MODULE_VERSION=1.1
-CORE_COMMIT=90bb3d43634b56b38834a239f3129d3009ece9d4
-CORE_PATCH_SET=akihalink-upstream-ebpf-v16
+MODULE_VERSION=1.2.0
+CORE_COMMIT=10e9a4258e44536ef30cefc3e603e39439ebc02c
+CORE_PATCH_SET=akihalink-upstream-ebpf-v17
 MAIN_API_PORT=9090
 SPEEDTEST_PORT=19090
 SPEEDTEST_TIMEOUT_SECONDS=1800
@@ -745,7 +745,7 @@ stop_processes() {
 }
 
 # Application exclusions are the only mutable part of AkihaLink's eBPF UID
-# policy. The core performs a canonical Go-side comparison of decoded v15
+# policy. The core performs a canonical Go-side comparison of decoded v17
 # configurations so formatting or key order cannot weaken the update gate.
 same_config_except_ebpf_exclusions() {
   "$CORE" akihalink-daemon compare-config-except-uid "$1" "$2" \
@@ -777,7 +777,7 @@ write_probe_config() {
   probe_config=$1
   cat > "$probe_config" <<'EOF'
 {
-  "log": {"level": "info", "timestamp": true},
+  "log": {"level": "debug", "timestamp": true},
   "dns": {
     "servers": [{
       "type": "udp",
@@ -790,9 +790,10 @@ write_probe_config() {
   "inbounds": [{
     "type": "ebpf",
     "tag": "probe-in",
-    "mode": "local",
     "network": ["tcp", "udp"],
     "local": {
+      "enabled": true,
+      "data_plane": "cgroup",
       "dns_mode": "hijack",
       "include_uid": [4294967294],
       "include_uid_range": [],
@@ -812,7 +813,7 @@ write_hotspot_probe_config() {
   printf '%s' "$probe_interface" | grep -Eq '^aklp[0-9]{1,10}$' || return 1
   cat > "$probe_config" <<EOF
 {
-  "log": {"level": "info", "timestamp": true},
+  "log": {"level": "debug", "timestamp": true},
   "dns": {
     "servers": [{
       "type": "udp",
@@ -825,15 +826,13 @@ write_hotspot_probe_config() {
   "inbounds": [{
     "type": "ebpf",
     "tag": "hotspot-probe-in",
-    "mode": "shared",
+    "tc_priority": 1,
     "network": ["tcp", "udp"],
     "shared": {
+      "enabled": true,
+      "data_plane": "packet_rewrite",
       "dns_mode": "off",
-      "interface": ["$probe_interface"],
-      "advanced": {
-        "tc_priority": 1,
-        "data_plane": "rewrite"
-      }
+      "interface": ["$probe_interface"]
     }
   }],
   "outbounds": [{"type": "direct", "tag": "direct"}],
@@ -844,7 +843,7 @@ EOF
 }
 
 hotspot_probe_ready() {
-  grep -Eq 'eBPF shared-network (TC interception ready|waiting for downstream interfaces)' "$1"
+  grep -Eq 'eBPF shared packet-rewrite waiting for downstream interfaces|eBPF TC active:' "$1"
 }
 
 hotspot_probe_signature() {
@@ -854,10 +853,8 @@ hotspot_probe_signature() {
 }
 
 ebpf_probe_ready() {
-  # sing-box 1.14 reports successful cgroup interception with this marker.
-  # The pre-upgrade backend used "eBPF inbound attached", which no longer
-  # appears even when the upstream eBPF inbound is ready.
-  grep -q 'eBPF local cgroup interception ready' "$1"
+  # The pinned 1.15 runtime emits this after cgroup attach completes.
+  grep -q 'eBPF cgroup active:' "$1"
 }
 
 terminate_probe() {
@@ -1547,7 +1544,7 @@ case "$command" in
       probe_log="$RUNTIME/probe.$$.log"
       probe_status="$RUNTIME/probe-status.$$.json"
       preflight_ok=false
-      if "$CORE" tools ebpf status --mode local --network tcp,udp --json \
+      if "$CORE" tools ebpf status --mode local --local-data-plane cgroup --network tcp,udp --json \
         > "$probe_status" 2> "$probe_log"; then
         preflight_ok=true
       fi
@@ -1607,7 +1604,7 @@ case "$command" in
     preflight_supported=false
     # An absent hotspot is a waiting state, so probe shared capabilities without
     # turning the deliberately nonexistent interface into a required failure.
-    if "$CORE" tools ebpf status --mode shared-network --network tcp,udp \
+    if "$CORE" tools ebpf status --mode shared --shared-data-plane packet_rewrite --network tcp,udp \
       --json > "$probe_status" 2> "$probe_log"; then
       preflight_supported=true
     fi

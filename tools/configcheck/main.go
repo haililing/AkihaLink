@@ -21,7 +21,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: configcheck <config>...")
 		os.Exit(2)
 	}
-	C.Version = "v1.14.0-rc.1-9-g90bb3d43-akihalink-upstream-ebpf-v16"
+	C.Version = "v1.15.0-alpha.2-10e9a425-akihalink-upstream-ebpf-v17"
 	ctx := include.Context(service.ContextWith(context.Background(), deprecated.NewStderrManager(log.StdLogger())))
 	for _, path := range os.Args[1:] {
 		content, err := os.ReadFile(path)
@@ -66,11 +66,12 @@ func validateEBPFInbounds(path string, inbounds []option.Inbound) (int, error) {
 		if !loaded || options == nil {
 			return 0, fmt.Errorf("eBPF inbound options were not decoded by the pinned core")
 		}
-		if options.Mode != "local" && options.Mode != "hybrid" {
-			return 0, fmt.Errorf("AkihaLink eBPF mode must be local or hybrid, found %q", options.Mode)
+		localEnabled, sharedEnabled := options.EffectiveEnablement()
+		if !localEnabled || options.Local.DataPlane != "cgroup" {
+			return 0, fmt.Errorf("AkihaLink requires local.enabled and local.data_plane=cgroup")
 		}
-		if options.TCPSplice {
-			return 0, fmt.Errorf("experimental tcp_splice must remain disabled")
+		if options.FakeIPICMP != "" && options.FakeIPICMP != "off" {
+			return 0, fmt.Errorf("FakeIP ICMP replies are not enabled by AkihaLink")
 		}
 		networks := options.Network.Build()
 		if len(networks) != 2 || networks[0] != "tcp" || networks[1] != "udp" {
@@ -82,21 +83,20 @@ func validateEBPFInbounds(path string, inbounds []option.Inbound) (int, error) {
 		if len(options.Local.IncludeUID) != 0 || len(options.Local.IncludeUIDRange) != 0 {
 			return 0, fmt.Errorf("AkihaLink local include UID lists must remain empty")
 		}
-		if options.Mode == "local" {
+		if !sharedEnabled {
 			if options.Shared.DNSMode != "" || options.Shared.AndroidTethering != "" ||
-				len(options.Shared.Interface) != 0 || options.Shared.Advanced.TCPriority != 0 ||
-				options.Shared.Advanced.DataPlane != "" {
+				len(options.Shared.Interface) != 0 || options.Shared.DataPlane != "" {
 				return 0, fmt.Errorf("local mode must not contain shared options")
 			}
 		} else {
 			if options.Shared.DNSMode != "hijack" || options.Shared.AndroidTethering != "wifi" {
-				return 0, fmt.Errorf("hybrid mode requires shared DNS hijack and Android Wi-Fi tethering discovery")
+				return 0, fmt.Errorf("shared interception requires shared DNS hijack and Android Wi-Fi tethering discovery")
 			}
 			if len(options.Shared.Interface) != 0 {
 				return 0, fmt.Errorf("dynamic Android tethering must not pin shared.interface")
 			}
-			if options.Shared.Advanced.TCPriority != 1 || options.Shared.Advanced.DataPlane != "rewrite" {
-				return 0, fmt.Errorf("hybrid mode requires tc_priority 1 and rewrite data plane")
+			if options.TCPriority != 1 || options.Shared.DataPlane != "packet_rewrite" {
+				return 0, fmt.Errorf("shared interception requires tc_priority 1 and packet_rewrite data plane")
 			}
 		}
 		count++

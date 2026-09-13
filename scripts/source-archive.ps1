@@ -1,12 +1,12 @@
 param(
     [string]$Output = "",
-    [string]$Version = "1.1",
+    [string]$Version = "1.2.0",
     [long]$SourceDateEpoch = 0
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
-$pinnedLocalGo = Join-Path $root "build/toolchains/go1.26.6/bin/go.exe"
+$pinnedLocalGo = Join-Path $root "build/toolchains/go1.26.7/bin/go.exe"
 $goCommand = Get-Command go -ErrorAction SilentlyContinue
 $go = if (Test-Path $pinnedLocalGo) {
     $pinnedLocalGo
@@ -15,9 +15,9 @@ $go = if (Test-Path $pinnedLocalGo) {
 } else {
     Join-Path $root "build/toolchains/go/bin/go.exe"
 }
-if (-not (Test-Path $go)) { throw "Go 1.26.6 toolchain is unavailable" }
+if (-not (Test-Path $go)) { throw "Go 1.26.7 toolchain is unavailable" }
 $goVersion = (& $go version)
-if ($goVersion -notmatch 'go1\.26\.6\b') { throw "Go 1.26.6 is required (found: $goVersion)" }
+if ($goVersion -notmatch 'go1\.26\.7\b') { throw "Go 1.26.7 is required (found: $goVersion)" }
 if (-not $Output) { $Output = Join-Path $root "build/outputs/AkihaLink-$Version-source.tar.gz" }
 New-Item -ItemType Directory -Path (Split-Path $Output -Parent) -Force | Out-Null
 

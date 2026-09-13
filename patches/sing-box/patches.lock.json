@@ -1,6 +1,6 @@
 {
-  "baseCommit": "90bb3d43634b56b38834a239f3129d3009ece9d4",
-  "baseVersion": "v1.14.0-rc.1-9-g90bb3d43",
+  "baseCommit": "10e9a4258e44536ef30cefc3e603e39439ebc02c",
+  "baseVersion": "v1.15.0-alpha.2-10e9a425",
   "patchSet": "akihalink-upstream-clean-v1",
   "patches": []
 }

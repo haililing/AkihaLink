@@ -1,8 +1,8 @@
 FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG GO_ARCHIVE=go1.26.6.linux-amd64.tar.gz
-ARG GO_SHA256=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89
+ARG GO_ARCHIVE=go1.26.7.linux-amd64.tar.gz
+ARG GO_SHA256=ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca
 ARG ANDROID_TOOLS=commandlinetools-linux-15859902_latest.zip
 ARG ANDROID_TOOLS_SHA1=040d3996a65543d22ec4bf73e4c37aa37a8d4af4
 ARG POWERSHELL_ARCHIVE=powershell-7.5.3-linux-x64.tar.gz

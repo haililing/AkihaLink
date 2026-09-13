@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/sagernet/netlink"
@@ -30,6 +31,10 @@ type sharedNetworkJournal struct {
 	InterfaceIndex        int    `json:"interfaceIndex"`
 	RouteLocalnetOriginal int    `json:"routeLocalnetOriginal"`
 	CreatedClsact         bool   `json:"createdClsact"`
+	IngressName           string `json:"ingressName,omitempty"`
+	EgressName            string `json:"egressName,omitempty"`
+	IngressHandle         uint16 `json:"ingressHandle,omitempty"`
+	EgressHandle          uint16 `json:"egressHandle,omitempty"`
 }
 
 // CleanupSharedNetwork removes only TC state recorded by this AkihaLink
@@ -78,7 +83,7 @@ func cleanupSharedNetworkJournal(path string) error {
 		err = closeErr
 	}
 	if err != nil || !safeSharedInterfaceName.MatchString(record.InterfaceName) || record.InterfaceIndex <= 0 ||
-		(record.RouteLocalnetOriginal != 0 && record.RouteLocalnetOriginal != 1) {
+		(record.RouteLocalnetOriginal != 0 && record.RouteLocalnetOriginal != 1) || !validSharedFilterIdentity(record) {
 		return fmt.Errorf("invalid shared-network ownership record")
 	}
 	link, err := netlink.LinkByName(record.InterfaceName)
@@ -91,7 +96,7 @@ func cleanupSharedNetworkJournal(path string) error {
 	if link.Attrs() == nil || link.Attrs().Index != record.InterfaceIndex {
 		return os.Remove(path)
 	}
-	if err = removeOwnedSharedFilters(link); err != nil {
+	if err = removeOwnedSharedFilters(link, record); err != nil {
 		return err
 	}
 	if record.RouteLocalnetOriginal == 0 {
@@ -114,14 +119,46 @@ func cleanupSharedNetworkJournal(path string) error {
 	return os.Remove(path)
 }
 
-func removeOwnedSharedFilters(link netlink.Link) error {
+func validSharedFilterIdentity(record sharedNetworkJournal) bool {
+	if record.IngressName == "" && record.EgressName == "" {
+		return record.IngressHandle == 0 && record.EgressHandle == 0
+	}
+	if record.IngressHandle == 0 || record.EgressHandle == 0 {
+		return false
+	}
+	if record.IngressName == sharedIngressFilterName && record.EgressName == sharedEgressFilterName {
+		return record.IngressHandle == sharedIngressFilterHandle && record.EgressHandle == sharedEgressFilterHandle
+	}
+	if !strings.HasPrefix(record.IngressName, "sbi") || !strings.HasPrefix(record.EgressName, "sbo") {
+		return false
+	}
+	ingress := strings.TrimPrefix(record.IngressName, "sbi")
+	egress := strings.TrimPrefix(record.EgressName, "sbo")
+	sequence, err := strconv.ParseUint(ingress, 16, 12)
+	return err == nil && sequence > 0 && ingress == egress &&
+		strconv.FormatUint(sequence, 16) == ingress &&
+		record.IngressHandle == sharedIngressFilterHandle+uint16(sequence) &&
+		record.EgressHandle == sharedEgressFilterHandle+uint16(sequence)
+}
+
+func removeOwnedSharedFilters(link netlink.Link, records ...sharedNetworkJournal) error {
+	ingressName, egressName := sharedIngressFilterName, sharedEgressFilterName
+	ingressHandle, egressHandle := uint16(sharedIngressFilterHandle), uint16(sharedEgressFilterHandle)
+	if len(records) > 0 && records[0].IngressName != "" {
+		record := records[0]
+		if !validSharedFilterIdentity(record) {
+			return fmt.Errorf("invalid shared filter identity")
+		}
+		ingressName, egressName = record.IngressName, record.EgressName
+		ingressHandle, egressHandle = record.IngressHandle, record.EgressHandle
+	}
 	for _, owned := range []struct {
 		parent uint32
 		handle uint16
 		name   string
 	}{
-		{netlink.HANDLE_MIN_INGRESS, sharedIngressFilterHandle, sharedIngressFilterName},
-		{netlink.HANDLE_MIN_EGRESS, sharedEgressFilterHandle, sharedEgressFilterName},
+		{netlink.HANDLE_MIN_INGRESS, ingressHandle, ingressName},
+		{netlink.HANDLE_MIN_EGRESS, egressHandle, egressName},
 	} {
 		filters, err := netlink.FilterList(link, owned.parent)
 		if err != nil {
@@ -135,7 +172,7 @@ func removeOwnedSharedFilters(link netlink.Link) error {
 				continue
 			}
 			if err = netlink.FilterDel(filter); err != nil && !isMissingSharedLink(err) &&
-				!errors.Is(err, unix.ESRCH) {
+				!errors.Is(err, unix.ESRCH) && !errors.Is(err, unix.EINVAL) {
 				return err
 			}
 		}

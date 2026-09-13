@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version (for example, 1.1)
+        description: Release version (for example, 1.2.0)
         required: true
         type: string
   push:
@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 env:
-  CORE_COMMIT: 90bb3d43634b56b38834a239f3129d3009ece9d4
-  CORE_PATCH_SET: akihalink-upstream-ebpf-v15
+  CORE_COMMIT: 10e9a4258e44536ef30cefc3e603e39439ebc02c
+  CORE_PATCH_SET: akihalink-upstream-ebpf-v17
 
 jobs:
   preflight:
@@ -104,10 +104,10 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Set up Go 1.26.6
+      - name: Set up Go 1.26.7
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: 1.26.6
+          go-version: 1.26.7
           cache: false
 
       - name: Install Android NDK r29
@@ -133,29 +133,7 @@ jobs:
         shell: bash
         working-directory: build/core-source
         run: |
-          test_binary="$RUNNER_TEMP/akihalink-ebpf-verifier"
-          shared_test_binary="$RUNNER_TEMP/akihalink-ebpf-shared-verifier"
-          cgroup="/sys/fs/cgroup/akihalink-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          go test -c -tags with_ebpf,ebpf_integration \
-            -o "$test_binary" ./common/ebpf
-          go test -c -tags with_ebpf,ebpf_integration \
-            -o "$shared_test_binary" ./protocol/ebpf
-          sudo mkdir "$cgroup"
-          cleanup() {
-            sudo rmdir "$cgroup"
-            rm -f "$test_binary" "$shared_test_binary"
-          }
-          trap cleanup EXIT
-          sudo env \
-            SING_BOX_EBPF_INTEGRATION=1 \
-            SING_BOX_EBPF_INTEGRATION_ATTACH=1 \
-            SING_BOX_EBPF_INTEGRATION_CGROUP="$cgroup" \
-            "$test_binary" -test.v \
-            -test.run '^Test(CgroupBackendProgramLoad|CgroupBackendTraffic|SharedNetwork(SharedMap|Standalone)ProgramLoad|MapBatch|UIDPolicyMapTransaction|UIDPolicyMapCapacityFailureRollsBack)Integration$'
-          sudo env \
-            SING_BOX_EBPF_SHARED_INTEGRATION=1 \
-            "$shared_test_binary" -test.v \
-            -test.run '^TestSharedNetworkDataPathIntegration$'
+          bash ../../scripts/verify-ebpf-kernel.sh "$PWD"
 
   build:
     needs: [preflight, draft-release, verifier]
@@ -189,7 +167,7 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git -C third_party/sing-box rev-parse HEAD)" = "$CORE_COMMIT"
           test "$(java -version 2>&1 | head -n1 | grep -o '21[^\" ]*')" != ""
-          test "$(go env GOVERSION)" = "go1.26.6"
+          test "$(go env GOVERSION)" = "go1.26.7"
           test -x "$ANDROID_HOME/build-tools/36.0.0/apksigner"
           test -x "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           epoch="$(git show -s --format=%ct "$GITHUB_SHA")"

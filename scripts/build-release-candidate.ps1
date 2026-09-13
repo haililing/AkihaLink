@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Output,
     [string]$Ndk = "$env:ANDROID_NDK_HOME",
-    [string]$Version = "1.1",
+    [string]$Version = "1.2.0",
     [long]$SourceDateEpoch = 0
 )
 

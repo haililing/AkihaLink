@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
-$version = "1.1"
+$version = "1.2.0"
 $versionCode = 23
 $protocol = 16
 if (-not $Core) { $Core = Join-Path $root "build/core/sing-box" }
@@ -42,7 +42,7 @@ $controller = [regex]::Replace($controller, '(?m)^MODULE_VERSION=.*$', "MODULE_V
 $controller = [regex]::Replace(
     $controller,
     '(?m)^CORE_PATCH_SET=.*$',
-    'CORE_PATCH_SET=akihalink-upstream-ebpf-v16'
+    'CORE_PATCH_SET=akihalink-upstream-ebpf-v17'
 )
 [IO.File]::WriteAllText($controllerPath, $controller, [Text.UTF8Encoding]::new($false))
 
@@ -73,7 +73,7 @@ if ($SourceDateEpoch -le 0) {
 
 $stagingRoot = (Resolve-Path $staging).Path.TrimEnd('\', '/')
 $outputPath = [IO.Path]::GetFullPath($Output)
-$pinnedLocalGo = Join-Path $root "build/toolchains/go1.26.6/bin/go.exe"
+$pinnedLocalGo = Join-Path $root "build/toolchains/go1.26.7/bin/go.exe"
 $goCommand = Get-Command go -ErrorAction SilentlyContinue
 $goExecutable = if (Test-Path $pinnedLocalGo) {
     $pinnedLocalGo
@@ -83,10 +83,10 @@ $goExecutable = if (Test-Path $pinnedLocalGo) {
     Join-Path $root "build/toolchains/go/bin/go.exe"
 }
 if (-not (Test-Path $goExecutable)) {
-    throw "Go 1.26.6 toolchain is unavailable. Run scripts/build-core.ps1 to provision the pinned toolchain."
+    throw "Go 1.26.7 toolchain is unavailable. Run scripts/build-core.ps1 to provision the pinned toolchain."
 }
 $goVersion = (& $goExecutable version)
-if ($goVersion -notmatch 'go1\.26\.6\b') { throw "Go 1.26.6 is required (found: $goVersion)" }
+if ($goVersion -notmatch 'go1\.26\.7\b') { throw "Go 1.26.7 is required (found: $goVersion)" }
 & $goExecutable run (Join-Path $root "tools/repropack/main.go") `
     zip $stagingRoot $outputPath $SourceDateEpoch
 if ($LASTEXITCODE -ne 0) { throw "Deterministic module packaging failed" }

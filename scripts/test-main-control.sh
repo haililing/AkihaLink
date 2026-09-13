@@ -52,7 +52,7 @@ case "${1:-}" in
     exit 0
     ;;
   version)
-    printf '%s\n' "${MOCK_CORE_VERSION:-sing-box version v1.14.0-rc.1-9-g90bb3d43-akihalink-upstream-ebpf-v16}"
+    printf '%s\n' "${MOCK_CORE_VERSION:-sing-box version v1.15.0-alpha.2-10e9a425-akihalink-upstream-ebpf-v17}"
     ;;
   tools)
     if [ "${2:-}" = ebpf ] && [ "${3:-}" = status ]; then
@@ -73,9 +73,9 @@ case "${1:-}" in
       exit 2
     fi
     if grep -q 'hotspot-probe-in' "${3:-/dev/null}" 2>/dev/null; then
-      printf '%s\n' 'INFO eBPF shared-network TC interception ready: downstream_interfaces=[waiting for fixture probe interface]'
+      printf '%s\n' 'DEBUG eBPF shared packet-rewrite waiting for downstream interfaces: interfaces=[fixture]'
     fi
-    printf '%s\n' 'INFO eBPF local cgroup interception ready: fixture probe'
+    printf '%s\n' 'INFO eBPF cgroup active:: fixture probe'
     proc_root="${AKIHALINK_TEST_PROC_ROOT:?}"
     mkdir -p "$proc_root/$$/net"
     if [ "${MOCK_MAIN_API_READY:-1}" = 1 ]; then
@@ -200,7 +200,7 @@ TABLE
           write_starttime "$child" > "$runtime/$name.starttime"
           printf '%s\n' $$ > "$runtime/$name.supervisor.pid"
           write_starttime $$ > "$runtime/$name.supervisor.starttime"
-          printf '%s\n' 'INFO eBPF local cgroup interception ready: fixture probe' > "$log"
+          printf '%s\n' 'INFO eBPF cgroup active:: fixture probe' > "$log"
           trap 'kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' TERM INT
           wait "$child"
           exit
@@ -298,7 +298,7 @@ chmod 0755 "$tmp/mock-bin/dumpsys" "$tmp/mock-bin/service" "$tmp/mock-bin/ip" "$
 cat > "$tmp/valid.json" <<'EOF'
 {
   "log": {"level": "warn"},
-  "inbounds": [{"type":"ebpf","tag":"ebpf-in","mode":"local","network":["tcp","udp"],"local":{"dns_mode":"hijack","include_uid":[],"include_uid_range":[],"exclude_uid":[]}}],
+  "inbounds": [{"type":"ebpf","tag":"ebpf-in","network":["tcp","udp"],"local":{"enabled":true,"data_plane":"cgroup","dns_mode":"hijack","include_uid":[],"include_uid_range":[],"exclude_uid":[]}}],
   "outbounds": [{"type": "direct", "tag": "direct"}],
   "experimental": {"clash_api": {"external_controller": "127.0.0.1:9090", "secret": "fixture"}}
 }
@@ -307,14 +307,14 @@ EOF
 cat > "$tmp/excluded.json" <<'EOF'
 {
   "log": {"level": "warn"},
-  "inbounds": [{"type":"ebpf","tag":"ebpf-in","mode":"local","network":["tcp","udp"],"local":{"dns_mode":"hijack","include_uid":[],"include_uid_range":[],"exclude_uid":[10123]}}],
+  "inbounds": [{"type":"ebpf","tag":"ebpf-in","network":["tcp","udp"],"local":{"enabled":true,"data_plane":"cgroup","dns_mode":"hijack","include_uid":[],"include_uid_range":[],"exclude_uid":[10123]}}],
   "outbounds": [{"type": "direct", "tag": "direct"}],
   "experimental": {"clash_api": {"external_controller": "127.0.0.1:9090", "secret": "fixture"}}
 }
 EOF
 
 cat > "$tmp/missing-controller.json" <<'EOF'
-{"inbounds":[{"type":"ebpf","mode":"local","network":["tcp","udp"],"local":{"dns_mode":"hijack"}}],"outbounds":[{"type":"direct"}]}
+{"inbounds":[{"type":"ebpf","network":["tcp","udp"],"local":{"enabled":true,"data_plane":"cgroup","dns_mode":"hijack"}}],"outbounds":[{"type":"direct"}]}
 EOF
 
 cat > "$tmp/exclusion-targets.json" <<'EOF'
@@ -337,7 +337,7 @@ EOF
 # 50 KB. Redirect comparison must stay linear rather than backtracking across
 # every outbound while searching for the small eBPF inbound object.
 {
-  printf '%s' '{"log":{"level":"warn"},"inbounds":[{"type":"ebpf","tag":"ebpf-in","mode":"local","network":["tcp","udp"],"local":{"dns_mode":"hijack","include_uid":[],"include_uid_range":[],"exclude_uid":[]}}],"outbounds":['
+  printf '%s' '{"log":{"level":"warn"},"inbounds":[{"type":"ebpf","tag":"ebpf-in","network":["tcp","udp"],"local":{"enabled":true,"data_plane":"cgroup","dns_mode":"hijack","include_uid":[],"include_uid_range":[],"exclude_uid":[]}}],"outbounds":['
   index=0
   while [ "$index" -lt 600 ]; do
     [ "$index" -eq 0 ] || printf ','
@@ -369,8 +369,8 @@ run_ctl() {
 }
 
 version_json="$(run_ctl version)"
-printf '%s' "$version_json" | grep -q '"corePatchSet":"akihalink-upstream-ebpf-v16"'
-stale_version_json="$(MOCK_CORE_VERSION='sing-box version v1.14.0-rc.1-9-g90bb3d43-akihalink-upstream-ebpf-v9' run_ctl version)"
+printf '%s' "$version_json" | grep -q '"corePatchSet":"akihalink-upstream-ebpf-v17"'
+stale_version_json="$(MOCK_CORE_VERSION='sing-box version v1.15.0-alpha.2-10e9a425-akihalink-upstream-ebpf-v9' run_ctl version)"
 printf '%s' "$stale_version_json" | grep -q '"corePatchSet":""'
 
 set_system_resolver_fixture() {

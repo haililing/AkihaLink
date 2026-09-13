@@ -32,13 +32,13 @@ android {
         applicationId = "com.akiha.akihalink"
         minSdk = 36
         targetSdk = 36
-        versionCode = 23
-        versionName = "1.1"
+        versionCode = 24
+        versionName = "1.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "EDITION", "\"generic\"")
         buildConfigField("int", "CONTROL_PROTOCOL_VERSION", "16")
-        buildConfigField("String", "CORE_COMMIT", "\"90bb3d43634b56b38834a239f3129d3009ece9d4\"")
-        buildConfigField("String", "CORE_PATCH_SET", "\"akihalink-upstream-ebpf-v16\"")
+        buildConfigField("String", "CORE_COMMIT", "\"10e9a4258e44536ef30cefc3e603e39439ebc02c\"")
+        buildConfigField("String", "CORE_PATCH_SET", "\"akihalink-upstream-ebpf-v17\"")
         ndk {
             abiFilters += "arm64-v8a"
         }

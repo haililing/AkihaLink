@@ -21,21 +21,21 @@ if (-not $packager.Contains('Module ZIP contains Windows path separators')) {
 }
 if ($packager -notmatch 'tools/repropack/main\.go' -or
     $packager -notmatch 'SourceDateEpoch' -or
-    $packager -notmatch 'go1\\\.26\\\.6') {
+    $packager -notmatch 'go1\\\.26\\\.7') {
     throw "Generic module packager is not deterministic"
 }
 $apkNormalizer = Get-Content (Join-Path $root "scripts/normalize-apk.ps1") -Raw
-if ($apkNormalizer -notmatch 'build/toolchains/go1\.26\.6/bin/go\.exe' -or
-    $apkNormalizer -notmatch "go1\\\.26\\\.6" -or
+if ($apkNormalizer -notmatch 'build/toolchains/go1\.26\.7/bin/go\.exe' -or
+    $apkNormalizer -notmatch "go1\\\.26\\\.7" -or
     $apkNormalizer -match '& go run') {
-    throw "APK normalizer does not use the locked Go 1.26.6 toolchain"
+    throw "APK normalizer does not use the locked Go 1.26.7 toolchain"
 }
 $artifactBuilder = Get-Content (Join-Path $root "scripts/build-artifacts.ps1") -Raw
 $benchmarkRunner = Get-Content (Join-Path $root "scripts/benchmark-dataplane.ps1") -Raw
-if ($artifactBuilder -notmatch '\[string\]\$Version = "1\.1"' -or
+if ($artifactBuilder -notmatch '\[string\]\$Version = "1\.2\.0"' -or
     $artifactBuilder -match 'AkihaLink-(KSU-)?1\.0' -or
-    $benchmarkRunner -notmatch 'ValidateSet\("0\.15\.0", "0\.16\.0", "1\.1"\)') {
-    throw "Artifact and benchmark scripts are not aligned with AkihaLink 1.1"
+    $benchmarkRunner -notmatch 'ValidateSet\("0\.15\.0", "0\.16\.0", "1\.1", "1\.2\.0"\)') {
+    throw "Artifact and benchmark scripts are not aligned with AkihaLink 1.2.0"
 }
 
 $scripts = @(
@@ -45,6 +45,7 @@ $scripts = @(
 $fixtureScripts = @(
     (Join-Path $root "scripts/fixtures/kernel-capabilities-fixture.sh"),
     (Join-Path $root "scripts/test-main-control.sh"),
+    (Join-Path $root "scripts/verify-ebpf-kernel.sh"),
     (Join-Path $root "scripts/test-speedtest-control.sh"),
     (Join-Path $root "scripts/ci-network-path-test.sh"),
     (Join-Path $root "scripts/test-trace-control.sh")
@@ -81,9 +82,9 @@ foreach ($command in @(
     if ($controller -notmatch [regex]::Escape($command)) { throw "Missing controller command: $command" }
 }
 if ($controller -notmatch '"type": "ebpf"') { throw "Probe config does not use the eBPF inbound" }
-if ($controller -notmatch '90bb3d43634b56b38834a239f3129d3009ece9d4') { throw "Core commit marker is missing" }
-if ($controller -notmatch 'akihalink-upstream-ebpf-v16') { throw "Core patch-set marker is missing" }
-if ($controller -notmatch '(?m)^PROTOCOL=16$' -or $controller -notmatch '(?m)^MODULE_VERSION=1\.1$') {
+if ($controller -notmatch '10e9a4258e44536ef30cefc3e603e39439ebc02c') { throw "Core commit marker is missing" }
+if ($controller -notmatch 'akihalink-upstream-ebpf-v17') { throw "Core patch-set marker is missing" }
+if ($controller -notmatch '(?m)^PROTOCOL=16$' -or $controller -notmatch '(?m)^MODULE_VERSION=1\.2\.0$') {
     throw "Controller version markers are stale"
 }
 $probeConfigWriter = [regex]::Match($controller, '(?s)write_probe_config\(\) \{(.*?)\r?\n\}').Groups[1].Value
@@ -95,11 +96,11 @@ if ($probeConfigWriter -notmatch '"type": "udp"' -or
     throw "eBPF probe does not define a minimal-core-compatible DNS fallback"
 }
 $hotspotProbeWriter = [regex]::Match($controller, '(?s)write_hotspot_probe_config\(\) \{(.*?)\r?\n\}').Groups[1].Value
-if ($hotspotProbeWriter -notmatch '"mode": "shared"' -or
+if ($hotspotProbeWriter -notmatch '"enabled": true' -or
     $hotspotProbeWriter -notmatch '"shared"' -or
     $hotspotProbeWriter -notmatch '\$probe_interface' -or
     $hotspotProbeWriter -notmatch '"tc_priority": 1' -or
-    $hotspotProbeWriter -notmatch '"data_plane": "rewrite"' -or
+    $hotspotProbeWriter -notmatch '"data_plane": "packet_rewrite"' -or
     $hotspotProbeWriter -notmatch '"type": "udp"' -or
     $hotspotProbeWriter -notmatch '"tag": "hotspot-probe-dns"' -or
     $hotspotProbeWriter -notmatch '"server": "127\.0\.0\.1"' -or
@@ -320,16 +321,16 @@ if ($submoduleCommit -ne $lock.baseCommit) { throw "Pinned sing-box commit does 
 if ([string]::IsNullOrWhiteSpace([string]$lock.baseVersion)) {
     throw "Pinned sing-box version is missing from the patch lock"
 }
-if ($lock.baseVersion -ne "v1.14.0-rc.1-9-g90bb3d43") {
+if ($lock.baseVersion -ne "v1.15.0-alpha.2-10e9a425") {
     throw "Pinned sing-box version is stale"
 }
 $coreBuildScript = Get-Content (Join-Path $root "scripts/build-core.ps1") -Raw
 $coreArtifactVerifier = Get-Content (Join-Path $root "scripts/verify-core-artifact.ps1") -Raw
 $modulePackager = Get-Content (Join-Path $root "scripts/package-module.ps1") -Raw
 $toolchainLock = Get-Content (Join-Path $root "release/toolchain.lock.json") -Raw | ConvertFrom-Json
-if ($toolchainLock.go.version -ne "1.26.6" -or
-    $toolchainLock.go.'windows-amd64'.sha256 -ne "5b6c5b556525810463b5c897b50dc7a82d6a3dc0bfaf55d990a7e9f31d6b2318" -or
-    $toolchainLock.go.'linux-amd64'.sha256 -ne "708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89" -or
+if ($toolchainLock.go.version -ne "1.26.7" -or
+    $toolchainLock.go.'windows-amd64'.sha256 -ne "f4f534a486e4bc3387fa18f08208f2f854b7aaea8a08f2a2d829a914a05abb11" -or
+    $toolchainLock.go.'linux-amd64'.sha256 -ne "ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca" -or
     $toolchainLock.android.ndk -ne "29.0.14206865" -or
     $toolchainLock.ciliumEbpf -ne "v0.22.1-0.20260724091036-00feb08ae4e5") {
     throw "Immutable release toolchain lock is stale"
@@ -366,15 +367,15 @@ foreach ($removedPgoPath in @(
         throw "Removed core PGO artifact remains: $removedPgoPath"
     }
 }
-if ($coreBuildScript -notmatch 'Go 1\.26\.6' -or
+if ($coreBuildScript -notmatch 'Go 1\.26\.7' -or
     $coreBuildScript -notmatch '29\.0\.14206865' -or
     $coreBuildScript -notmatch 'aarch64-linux-android35-clang' -or
     $coreBuildScript -notmatch 'Stem = "cgroup"' -or
     $coreBuildScript -notmatch 'Stem = "shared_network"' -or
-    $coreBuildScript -notmatch 'Stem = "splice"' -or
+    $coreBuildScript -notmatch 'Stem = "fakeip_icmp"' -or
     $coreBuildScript -notmatch 'bpfel,bpfeb' -or
     $coreBuildScript -match 'with_connection_history') {
-    throw "Core build is not pinned to Go 1.26.6/NDK r29 and all bpf2go objects"
+    throw "Core build is not pinned to Go 1.26.7/NDK r29 and all bpf2go objects"
 }
 foreach ($removedTag in @("with_gvisor", "with_dhcp", "with_provider")) {
     if ($coreBuildScript -match [regex]::Escape($removedTag)) {
@@ -440,7 +441,7 @@ if ($ciliumPatch -notmatch 'startUIDPolicyControl\(\)' -or
 if (Test-Path (Join-Path $root "core-overlay/common/ebpf/readiness_cgo.go")) {
     throw "Obsolete CGO readiness backend remains in the overlay"
 }
-if ($genericLock.patchSet -ne "akihalink-upstream-ebpf-v16" -or
+if ($genericLock.patchSet -ne "akihalink-upstream-ebpf-v17" -or
     $genericLock.dependencies.'github.com/cilium/ebpf' -ne 'v0.22.1-0.20260724091036-00feb08ae4e5' -or
     $genericLock.patches.file -notcontains "0015-akihalink-cilium-backend.patch" -or
     $genericLock.patches.file -contains "0003-akihalink-adaptive-transport.patch" -or
@@ -448,10 +449,10 @@ if ($genericLock.patchSet -ne "akihalink-upstream-ebpf-v16" -or
     $genericLock.patches.file -contains "0006-akihalink-content-metrics.patch") {
     throw "Generic core lock still enables a removed adaptive feature"
 }
-if ($ciliumPatch -notmatch 'exec\.Command\("dumpsys", service\)' -or
+if ($ciliumPatch -notmatch 'exec\.CommandContext\(ctx, "dumpsys", service\)' -or
     $ciliumPatch -notmatch 'androidTetheringDiscoveryTimeout.*2 \* time.Second' -or
-    $ciliumPatch -notmatch 'androidTetheringInterfaceResolver' -or
-    $ciliumPatch -notmatch 'disable shared-network after reconciliation failure') {
+    $ciliumPatch -notmatch 'activeSharedInterfaces' -or
+    $ciliumPatch -notmatch 'publishHotspotState') {
     throw "Locked Android Wi-Fi hotspot discovery or TC ownership patch is incomplete"
 }
 $sharedCleanup = Get-Content (Join-Path $root "core-overlay/experimental/akihalinkobs/shared_network_cleanup.go") -Raw
@@ -515,8 +516,8 @@ $gradleBuild = Get-Content (Join-Path $root "app/build.gradle.kts") -Raw
 $appVersion = [regex]::Match($gradleBuild, 'versionName = "([^"]+)"').Groups[1].Value
 $appVersionCode = [regex]::Match($gradleBuild, 'versionCode = (\d+)').Groups[1].Value
 if ($moduleVersion -ne $appVersion) { throw "App/module version mismatch: $appVersion vs $moduleVersion" }
-if ($appVersion -ne "1.1" -or $appVersionCode -ne "23" -or $moduleVersionCode -ne "23") {
-    throw "Release version markers must be App/module 1.1/23"
+if ($appVersion -ne "1.2.0" -or $appVersionCode -ne "24" -or $moduleVersionCode -ne "24") {
+    throw "Release version markers must be App/module 1.2.0/24"
 }
 $releaseCandidate = Get-Content (Join-Path $root "scripts/build-release-candidate.ps1") -Raw
 $releaseDefault = [regex]::Match($releaseCandidate, '\[string\]\$Version = "([^"]+)"').Groups[1].Value
@@ -529,9 +530,7 @@ if ($releaseWorkflow -match '0\.12\.2' -or
     throw "Release workflow does not derive all artifacts from the preflight version"
 }
 if ($releaseWorkflow -notmatch 'AKIHALINK_DEVICE_MATRIX_ATTESTATION' -or
-    $releaseWorkflow -notmatch 'SING_BOX_EBPF_INTEGRATION_ATTACH=1' -or
-    $releaseWorkflow -notmatch 'SING_BOX_EBPF_SHARED_INTEGRATION=1' -or
-    $releaseWorkflow -notmatch 'with_ebpf,ebpf_integration' -or
+    $releaseWorkflow -notmatch 'scripts/verify-ebpf-kernel\.sh' -or
     $releaseWorkflow -notmatch 'needs\.verifier\.result == ''success''') {
     throw "Release workflow does not gate publication on device acceptance and a real eBPF verifier run"
 }

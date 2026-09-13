@@ -50,16 +50,19 @@ class SingBoxConfigGeneratorTest {
 
         ProxyMode.entries.filter { it != ProxyMode.DIRECT }.forEach { mode ->
             val localOnly = inbound(mode, false)
-            assertEquals("local", localOnly.getValue("mode").jsonPrimitive.content)
+            assertFalse(localOnly.containsKey("mode"))
+            assertEquals("cgroup", localOnly.getValue("local").jsonObject.getValue("data_plane").jsonPrimitive.content)
             assertFalse(localOnly.containsKey("shared"))
             val hybrid = inbound(mode, true)
-            assertEquals("hybrid", hybrid.getValue("mode").jsonPrimitive.content)
+            assertFalse(hybrid.containsKey("mode"))
+            assertEquals("true", hybrid.getValue("local").jsonObject.getValue("enabled").jsonPrimitive.content)
             val shared = hybrid.getValue("shared").jsonObject
             assertEquals("hijack", shared.getValue("dns_mode").jsonPrimitive.content)
             assertEquals("wifi", shared.getValue("android_tethering").jsonPrimitive.content)
-            val advanced = shared.getValue("advanced").jsonObject
-            assertEquals("1", advanced.getValue("tc_priority").jsonPrimitive.content)
-            assertEquals("rewrite", advanced.getValue("data_plane").jsonPrimitive.content)
+            assertFalse(shared.containsKey("advanced"))
+            assertEquals("1", hybrid.getValue("tc_priority").jsonPrimitive.content)
+            assertEquals("true", shared.getValue("enabled").jsonPrimitive.content)
+            assertEquals("packet_rewrite", shared.getValue("data_plane").jsonPrimitive.content)
             assertFalse(shared.containsKey("interface"))
             assertFalse(hybrid.containsKey("shared_network"))
         }
@@ -109,7 +112,9 @@ class SingBoxConfigGeneratorTest {
         val inbound = root.getValue("inbounds").jsonArray.single().jsonObject
         val local = inbound.getValue("local").jsonObject
         assertEquals("ebpf", inbound.getValue("type").jsonPrimitive.content)
-        assertEquals("local", inbound.getValue("mode").jsonPrimitive.content)
+        assertFalse(inbound.containsKey("mode"))
+        assertEquals("cgroup", local.getValue("data_plane").jsonPrimitive.content)
+        assertEquals("true", local.getValue("enabled").jsonPrimitive.content)
         assertEquals("hijack", local.getValue("dns_mode").jsonPrimitive.content)
         assertFalse(inbound.containsKey("include_android_system_resolver"))
         assertFalse(inbound.containsKey("redirect_address"))
@@ -288,7 +293,9 @@ class SingBoxConfigGeneratorTest {
         val inbound = Json.parseToJsonElement(config).jsonObject
             .getValue("inbounds").jsonArray.single().jsonObject
         val local = inbound.getValue("local").jsonObject
-        assertEquals("local", inbound.getValue("mode").jsonPrimitive.content)
+        assertFalse(inbound.containsKey("mode"))
+        assertEquals("cgroup", local.getValue("data_plane").jsonPrimitive.content)
+        assertEquals("true", local.getValue("enabled").jsonPrimitive.content)
         assertEquals("hijack", local.getValue("dns_mode").jsonPrimitive.content)
         assertFalse(inbound.containsKey("include_android_system_resolver"))
         assertEquals(
@@ -343,7 +350,9 @@ class SingBoxConfigGeneratorTest {
 
             val inbound = root.getValue("inbounds").jsonArray.single().jsonObject
             val local = inbound.getValue("local").jsonObject
-            assertEquals("local", inbound.getValue("mode").jsonPrimitive.content)
+            assertFalse(inbound.containsKey("mode"))
+            assertEquals("cgroup", local.getValue("data_plane").jsonPrimitive.content)
+            assertEquals("true", local.getValue("enabled").jsonPrimitive.content)
             assertEquals("hijack", local.getValue("dns_mode").jsonPrimitive.content)
             assertFalse(inbound.containsKey("redirect_address"))
             assertEquals(

@@ -35,7 +35,7 @@ jobs:
           context: .
           file: release/toolchain.Dockerfile
           push: true
-          tags: ghcr.io/${{ steps.image.outputs.owner }}/akihalink-release-toolchain:jdk21-go1.26.6-ndkr29-sdk36-v2
+          tags: ghcr.io/${{ steps.image.outputs.owner }}/akihalink-release-toolchain:jdk21-go1.26.7-ndkr29-sdk36-v2
           provenance: mode=max
           sbom: true
 

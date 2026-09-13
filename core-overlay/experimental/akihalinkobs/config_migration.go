@@ -22,7 +22,8 @@ type ConfigMigrationResult struct {
 	Backup   string `json:"backup,omitempty"`
 }
 
-// MigrateV14Config performs the only supported persisted-config migration.
+// MigrateV14Config retains the daemon command's API while migrating both the
+// v14 flat layout and the v15/v16 RC1 layout directly to the v17 bundle schema.
 // Unknown legacy shapes are left byte-for-byte untouched so the module can
 // fail safe and ask the App to apply a fresh configuration.
 func MigrateV14Config(path string) (ConfigMigrationResult, error) {
@@ -44,6 +45,11 @@ func MigrateV14Config(path string) (ConfigMigrationResult, error) {
 		if migrateErr != nil {
 			return ConfigMigrationResult{}, migrateErr
 		}
+		updated, changedV16, migrateErr := migrateV16Inbound(updated)
+		if migrateErr != nil {
+			return ConfigMigrationResult{}, migrateErr
+		}
+		changed = changed || changedV16
 		if changed {
 			inbounds[index] = updated
 			migrated = true
@@ -60,10 +66,10 @@ func MigrateV14Config(path string) (ConfigMigrationResult, error) {
 	if err != nil {
 		return ConfigMigrationResult{}, err
 	}
-	backup := path + ".v14.bak"
+	backup := path + ".pre-v17.bak"
 	if _, statErr := os.Stat(backup); errors.Is(statErr, os.ErrNotExist) {
 		if err = atomicPrivateConfigWrite(backup, payload); err != nil {
-			return ConfigMigrationResult{}, fmt.Errorf("write v14 configuration backup: %w", err)
+			return ConfigMigrationResult{}, fmt.Errorf("write pre-v17 configuration backup: %w", err)
 		}
 	} else if statErr != nil {
 		return ConfigMigrationResult{}, statErr
@@ -83,6 +89,13 @@ func migrateV14Inbound(rawInbound json.RawMessage) (json.RawMessage, bool, error
 	_ = json.Unmarshal(inbound["type"], &inboundType)
 	if inboundType != "ebpf" {
 		return rawInbound, false, nil
+	}
+	if _, hasLocal := inbound["local"]; hasLocal {
+		if _, hasMode := inbound["mode"]; !hasMode {
+			// The new schema has no mode. Strict core decoding still validates it
+			// before the module starts, without rewriting current configurations.
+			return rawInbound, false, nil
+		}
 	}
 	if _, hasMode := inbound["mode"]; hasMode {
 		if _, hasLocal := inbound["local"]; !hasLocal {
@@ -182,6 +195,117 @@ func migrateV14Shared(raw json.RawMessage) (map[string]any, bool, error) {
 			"data_plane":  "rewrite",
 		},
 	}, true, nil
+}
+
+// Only migrate layouts emitted by released AkihaLink generators. Unknown
+// performance or routing overrides must be reapplied by the App explicitly.
+func migrateV16Inbound(raw json.RawMessage) (json.RawMessage, bool, error) {
+	var inbound map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &inbound); err != nil {
+		return nil, false, err
+	}
+	var kind, mode string
+	_ = json.Unmarshal(inbound["type"], &kind)
+	if kind != "ebpf" || inbound["mode"] == nil {
+		return raw, false, nil
+	}
+	if err := json.Unmarshal(inbound["mode"], &mode); err != nil || (mode != "local" && mode != "hybrid") {
+		return nil, false, errors.New("saved eBPF mode is not an AkihaLink local/hybrid configuration")
+	}
+	if err := requireMigrationFields(inbound, "type", "tag", "network", "udp_timeout", "bypass_rule_set", "mode", "local", "shared", "tcp_splice"); err != nil {
+		return nil, false, err
+	}
+	if splice, present := inbound["tcp_splice"]; present && !bytes.Equal(bytes.TrimSpace(splice), []byte("false")) {
+		return nil, false, errors.New("saved tcp_splice is unsupported by the new core")
+	}
+	var local map[string]json.RawMessage
+	if err := json.Unmarshal(inbound["local"], &local); err != nil || local == nil {
+		return nil, false, errors.New("saved eBPF local options are missing")
+	}
+	if err := requireMigrationFields(local, "dns_mode", "cgroup_path", "ipv6_mode", "bypass_private_address", "include_uid", "include_uid_range", "exclude_uid", "exclude_uid_range", "include_android_user", "include_package", "exclude_package"); err != nil {
+		return nil, false, err
+	}
+	if err := migrateIPv6Option(local, true); err != nil {
+		return nil, false, err
+	}
+	local["enabled"] = json.RawMessage(`true`)
+	local["data_plane"] = json.RawMessage(`"cgroup"`)
+	inbound["local"], _ = json.Marshal(local)
+	inbound["tc_priority"] = json.RawMessage(`1`)
+	if mode == "hybrid" {
+		var shared map[string]json.RawMessage
+		if err := json.Unmarshal(inbound["shared"], &shared); err != nil || shared == nil {
+			return nil, false, errors.New("saved hybrid eBPF shared options are missing")
+		}
+		if err := requireMigrationFields(shared, "dns_mode", "android_tethering", "ipv6_mode", "bypass_private_address", "advanced"); err != nil {
+			return nil, false, err
+		}
+		var tethering string
+		if err := json.Unmarshal(shared["android_tethering"], &tethering); err != nil || tethering != "wifi" {
+			return nil, false, errors.New("saved hotspot must use Android Wi-Fi discovery")
+		}
+		var advanced map[string]json.RawMessage
+		if err := json.Unmarshal(shared["advanced"], &advanced); err != nil || advanced == nil {
+			return nil, false, errors.New("saved hotspot advanced options are missing")
+		}
+		if err := requireMigrationFields(advanced, "tc_priority", "data_plane"); err != nil {
+			return nil, false, err
+		}
+		var priority int
+		var dataPlane string
+		if json.Unmarshal(advanced["tc_priority"], &priority) != nil || priority != 1 ||
+			json.Unmarshal(advanced["data_plane"], &dataPlane) != nil || dataPlane != "rewrite" {
+			return nil, false, errors.New("saved hotspot data plane or priority is not recognized")
+		}
+		if err := migrateIPv6Option(shared, false); err != nil {
+			return nil, false, err
+		}
+		delete(shared, "advanced")
+		shared["enabled"] = json.RawMessage(`true`)
+		shared["data_plane"] = json.RawMessage(`"packet_rewrite"`)
+		inbound["shared"], _ = json.Marshal(shared)
+	} else if _, present := inbound["shared"]; present {
+		return nil, false, errors.New("saved local eBPF configuration unexpectedly contains shared options")
+	}
+	delete(inbound, "mode")
+	delete(inbound, "tcp_splice")
+	updated, err := json.Marshal(inbound)
+	return updated, true, err
+}
+
+func requireMigrationFields(object map[string]json.RawMessage, allowed ...string) error {
+	for field := range object {
+		if !slices.Contains(allowed, field) {
+			return fmt.Errorf("saved eBPF configuration contains unsupported field %s", field)
+		}
+	}
+	return nil
+}
+
+func migrateIPv6Option(options map[string]json.RawMessage, local bool) error {
+	raw, present := options["ipv6_mode"]
+	if !present {
+		return nil
+	}
+	var mode string
+	if err := json.Unmarshal(raw, &mode); err != nil {
+		return errors.New("saved ipv6_mode is invalid")
+	}
+	switch mode {
+	case "off":
+		options["ipv6"] = json.RawMessage(`false`)
+	case "always":
+		options["ipv6"] = json.RawMessage(`true`)
+	case "auto":
+		if !local {
+			return errors.New("saved shared ipv6_mode=auto is invalid")
+		}
+		// 1.15 enables IPv6 by default and owns runtime address handling.
+	default:
+		return fmt.Errorf("saved ipv6_mode %q is not recognized", mode)
+	}
+	delete(options, "ipv6_mode")
+	return nil
 }
 
 func ConfigsEqualExceptUIDExclusions(leftPath, rightPath string) (bool, error) {

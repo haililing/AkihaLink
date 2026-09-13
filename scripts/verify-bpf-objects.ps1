@@ -8,35 +8,9 @@ param(
 $ErrorActionPreference = "Stop"
 if (-not (Test-Path -LiteralPath $ReadElf)) { throw "NDK llvm-readelf is unavailable: $ReadElf" }
 
-$schemas = @(
-    @{
-        Stem = "cgroup"
-        Sections = @("maps", "cgroup/connect4_tgid", "cgroup/sendmsg4_tgid", "cgroup/recvmsg4", "cgroup/sock_release_tgid")
-        Symbols = @(
-            "cgroup_control", "cgroup_stats", "cgroup_tcp_redirect", "cgroup_udp_redirect",
-            "cgroup_udp_recovery", "cgroup_udp_token", "cgroup_udp_peer", "cgroup_udp_flow",
-            "cgroup_socket_bypass", "cgroup_uid_policy", "cgroup_system_resolver_tgid",
-            "cgroup_bypass_ipv4", "cgroup_bypass_ipv6", "cgroup_host_ipv4", "cgroup_host_ipv6",
-            "cgroup_ipv6_available"
-        )
-    },
-    @{
-        Stem = "shared_network"
-        Sections = @("maps", "classifier/ingress", "classifier/egress")
-        Symbols = @(
-            "shared_control", "shared_stats", "shared_flow_by_original", "shared_bypass_flow",
-            "shared_flow_by_token", "shared_listener_sockets", "shared_assign_metadata", "shared_fragment",
-            "shared_host_ipv4", "shared_host_ipv6", "shared_include_source_ipv4", "shared_include_source_ipv6",
-            "shared_exclude_source_ipv4", "shared_exclude_source_ipv6", "shared_include_source_mac",
-            "shared_exclude_source_mac", "shared_bypass_ipv4", "shared_bypass_ipv6", "shared_scratch"
-        )
-    },
-    @{
-        Stem = "splice"
-        Sections = @("maps", "sk_skb/stream_parser", "sk_skb/stream_verdict")
-        Symbols = @("splice_sockets", "splice_peers", "splice_stats")
-    }
-)
+$root = Split-Path $PSScriptRoot -Parent
+$schemas = (Get-Content (Join-Path $root "patches/sing-box/bpf-objects.lock.json") -Raw | ConvertFrom-Json).objects
+if ($schemas.Count -ne 6) { throw "Expected six locked eBPF object families" }
 
 foreach ($schema in $schemas) {
     foreach ($endian in @("bpfel", "bpfeb")) {
@@ -85,4 +59,4 @@ foreach ($schema in $schemas) {
     }
 }
 
-Write-Host "Verified cgroup, shared-network, and splice bpf2go object schemas"
+Write-Host "Verified all six locked 1.15 eBPF object schemas"

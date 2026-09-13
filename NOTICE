@@ -3,9 +3,9 @@ Copyright (C) 2026 AkihaLink contributors
 
 This distribution includes and builds sing-box from:
 https://github.com/CHIZI-0618/sing-box
-Pinned revision: 90bb3d43634b56b38834a239f3129d3009ece9d4
+Pinned revision: 10e9a4258e44536ef30cefc3e603e39439ebc02c
 Base patch set: akihalink-upstream-clean-v1
-Generic overlay patch set: akihalink-upstream-ebpf-v16
+Generic overlay patch set: akihalink-upstream-ebpf-v17
 Patch locks: patches/sing-box/patches.lock.json and patches/sing-box/generic-patches.lock.json
 
 The sing-box eBPF implementation incorporates GPL-3.0 code derived from:

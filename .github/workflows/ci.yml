@@ -31,10 +31,10 @@ jobs:
           java-version: "21"
           cache: gradle
 
-      - name: Set up Go 1.26.6
+      - name: Set up Go 1.26.7
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: 1.26.6
+          go-version: 1.26.7
           cache: false
 
       - name: Install Android NDK r29
@@ -73,29 +73,7 @@ jobs:
         shell: bash
         working-directory: build/core-source
         run: |
-          test_binary="$RUNNER_TEMP/akihalink-ebpf-verifier"
-          shared_test_binary="$RUNNER_TEMP/akihalink-ebpf-shared-verifier"
-          cgroup="/sys/fs/cgroup/akihalink-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          go test -c -tags with_ebpf,ebpf_integration \
-            -o "$test_binary" ./common/ebpf
-          go test -c -tags with_ebpf,ebpf_integration \
-            -o "$shared_test_binary" ./protocol/ebpf
-          sudo mkdir "$cgroup"
-          cleanup() {
-            sudo rmdir "$cgroup"
-            rm -f "$test_binary" "$shared_test_binary"
-          }
-          trap cleanup EXIT
-          sudo env \
-            SING_BOX_EBPF_INTEGRATION=1 \
-            SING_BOX_EBPF_INTEGRATION_ATTACH=1 \
-            SING_BOX_EBPF_INTEGRATION_CGROUP="$cgroup" \
-            "$test_binary" -test.v \
-            -test.run '^Test(CgroupBackendProgramLoad|CgroupBackendTraffic|SharedNetwork(SharedMap|Standalone)ProgramLoad|MapBatch|UIDPolicyMapTransaction|UIDPolicyMapCapacityFailureRollsBack)Integration$'
-          sudo env \
-            SING_BOX_EBPF_SHARED_INTEGRATION=1 \
-            "$shared_test_binary" -test.v \
-            -test.run '^TestSharedNetworkDataPathIntegration$'
+          bash ../../scripts/verify-ebpf-kernel.sh "$PWD"
 
       - name: Run core observability and non-cgo compile checks
         shell: bash
